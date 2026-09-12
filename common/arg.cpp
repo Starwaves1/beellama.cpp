@@ -2401,7 +2401,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--reasoning-repeat-last-n"}, "N",
         "repeat history override while inside the reasoning block (default: inherit)",
         [](common_params & params, int value) {
-            if (value < -1) {
+            if (value < 0) {
                 throw std::runtime_error(string_format("error: invalid reasoning-repeat-last-n = %d\n", value));
             }
             params.sampling.reasoning_penalty_last_n = value;
@@ -2465,7 +2465,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--reasoning-dry-penalty-last-n"}, "N",
         "DRY history override while inside the reasoning block (default: inherit)",
         [](common_params & params, int value) {
-            if (value < -1) {
+            if (value < 0) {
                 throw std::runtime_error(string_format("error: invalid reasoning-dry-penalty-last-n = %d\n", value));
             }
             params.sampling.reasoning_dry_penalty_last_n = value;

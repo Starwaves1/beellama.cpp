@@ -328,7 +328,7 @@ struct common_params_sampling {
     float    reasoning_dry_multiplier     = 0.00f;
     float    reasoning_dry_base           = 1.75f;
     int32_t  reasoning_dry_allowed_length = 2;
-    int32_t  reasoning_dry_penalty_last_n = -1;
+    int32_t  reasoning_dry_penalty_last_n = 64;
     float    reasoning_top_n_sigma        = -1.00f;
 
     bool backend_sampling = false;
