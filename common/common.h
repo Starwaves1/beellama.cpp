@@ -155,33 +155,45 @@ struct common_grammar_trigger {
 };
 
 enum common_params_sampling_config : uint64_t {
-    COMMON_PARAMS_SAMPLING_CONFIG_SAMPLERS        = 1 << 0,
-    COMMON_PARAMS_SAMPLING_CONFIG_TOP_K           = 1 << 1,
-    COMMON_PARAMS_SAMPLING_CONFIG_TOP_P           = 1 << 2,
-    COMMON_PARAMS_SAMPLING_CONFIG_MIN_P           = 1 << 3,
-    COMMON_PARAMS_SAMPLING_CONFIG_XTC_PROBABILITY = 1 << 4,
-    COMMON_PARAMS_SAMPLING_CONFIG_XTC_THRESHOLD   = 1 << 5,
-    COMMON_PARAMS_SAMPLING_CONFIG_TEMP            = 1 << 6,
-    COMMON_PARAMS_SAMPLING_CONFIG_PENALTY_LAST_N  = 1 << 7,
-    COMMON_PARAMS_SAMPLING_CONFIG_PENALTY_REPEAT  = 1 << 8,
-    COMMON_PARAMS_SAMPLING_CONFIG_MIROSTAT        = 1 << 9,
-    COMMON_PARAMS_SAMPLING_CONFIG_MIROSTAT_TAU    = 1 << 10,
-    COMMON_PARAMS_SAMPLING_CONFIG_MIROSTAT_ETA    = 1 << 11,
+    COMMON_PARAMS_SAMPLING_CONFIG_SAMPLERS          = 1ULL << 0,
+    COMMON_PARAMS_SAMPLING_CONFIG_TOP_K             = 1ULL << 1,
+    COMMON_PARAMS_SAMPLING_CONFIG_TOP_P             = 1ULL << 2,
+    COMMON_PARAMS_SAMPLING_CONFIG_MIN_P             = 1ULL << 3,
+    COMMON_PARAMS_SAMPLING_CONFIG_XTC_PROBABILITY   = 1ULL << 4,
+    COMMON_PARAMS_SAMPLING_CONFIG_XTC_THRESHOLD     = 1ULL << 5,
+    COMMON_PARAMS_SAMPLING_CONFIG_TEMP              = 1ULL << 6,
+    COMMON_PARAMS_SAMPLING_CONFIG_PENALTY_LAST_N    = 1ULL << 7,
+    COMMON_PARAMS_SAMPLING_CONFIG_PENALTY_REPEAT    = 1ULL << 8,
+    COMMON_PARAMS_SAMPLING_CONFIG_MIROSTAT          = 1ULL << 9,
+    COMMON_PARAMS_SAMPLING_CONFIG_MIROSTAT_TAU      = 1ULL << 10,
+    COMMON_PARAMS_SAMPLING_CONFIG_MIROSTAT_ETA      = 1ULL << 11,
+    COMMON_PARAMS_SAMPLING_CONFIG_TOP_N_SIGMA       = 1ULL << 12,
+    COMMON_PARAMS_SAMPLING_CONFIG_TYPICAL_P         = 1ULL << 13,
+    COMMON_PARAMS_SAMPLING_CONFIG_DYNATEMP_RANGE    = 1ULL << 14,
+    COMMON_PARAMS_SAMPLING_CONFIG_DYNATEMP_EXPONENT = 1ULL << 15,
+    COMMON_PARAMS_SAMPLING_CONFIG_PENALTY_FREQ      = 1ULL << 16,
+    COMMON_PARAMS_SAMPLING_CONFIG_PENALTY_PRESENT   = 1ULL << 17,
+    COMMON_PARAMS_SAMPLING_CONFIG_DRY_MULTIPLIER    = 1ULL << 18,
+    COMMON_PARAMS_SAMPLING_CONFIG_DRY_BASE          = 1ULL << 19,
+    COMMON_PARAMS_SAMPLING_CONFIG_DRY_ALLOWED_LEN   = 1ULL << 20,
+    COMMON_PARAMS_SAMPLING_CONFIG_DRY_PENALTY_LAST_N = 1ULL << 21,
+    COMMON_PARAMS_SAMPLING_CONFIG_MIN_KEEP          = 1ULL << 24,
 };
 
 enum common_speculative_type {
-    COMMON_SPECULATIVE_TYPE_NONE,          // no speculative decoding
-    COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE,  // standalone draft model speculative decoding
-    COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3,  // Eagle3 speculative decoding
-    COMMON_SPECULATIVE_TYPE_DRAFT_MTP,     // Multi-token prediction
-    COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH,  // DFlash speculative decoding
-    COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK,  // DSpark speculative decoding (DFlash + Markov head)
-    COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,  // simple self-speculative decoding based on n-grams
-    COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K,   // self-speculative decoding with n-gram keys only
-    COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, // self-speculative decoding with n-gram keys and 4 m-gram values
+    COMMON_SPECULATIVE_TYPE_NONE,               // no speculative decoding
+    COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE,       // standalone draft model speculative decoding
+    COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3,       // Eagle3 speculative decoding
+    COMMON_SPECULATIVE_TYPE_DRAFT_MTP,          // Multi-token prediction
+    COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE, // Multi-token prediction with adaptive draft depth
+    COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH,       // DFlash speculative decoding
+    COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK,       // DSpark speculative decoding (DFlash + Markov head)
+    COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,       // simple self-speculative decoding based on n-grams
+    COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K,        // self-speculative decoding with n-gram keys only
+    COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V,      // self-speculative decoding with n-gram keys and 4 m-gram values
     COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
-    COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,   // self-speculative decoding with 3-level n-gram cache
-    COMMON_SPECULATIVE_TYPE_COUNT          // number of types, unknown type
+    COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,        // self-speculative decoding with 3-level n-gram cache
+    COMMON_SPECULATIVE_TYPE_COUNT               // number of types, unknown type
 };
 
 // Grammar type enumeration
@@ -295,6 +307,30 @@ struct common_params_sampling {
     bool                      reasoning_budget_tracking = false; // track reasoning state even with an unlimited budget
     bool                      reasoning_control = false;       // create the budget sampler on demand so reasoning can be ended at runtime
 
+    // Sampling overrides used while inside the reasoning block. The bitfield
+    // records which parameter values change within the shared sampler chain.
+    uint64_t reasoning_sampling = 0;
+
+    int32_t  reasoning_min_keep           = 0;
+    int32_t  reasoning_top_k              = 40;
+    float    reasoning_top_p              = 0.95f;
+    float    reasoning_min_p              = 0.05f;
+    float    reasoning_xtc_probability    = 0.00f;
+    float    reasoning_xtc_threshold      = 0.10f;
+    float    reasoning_typ_p              = 1.00f;
+    float    reasoning_temp               = 0.80f;
+    float    reasoning_dynatemp_range     = 0.00f;
+    float    reasoning_dynatemp_exponent  = 1.00f;
+    int32_t  reasoning_penalty_last_n     = 64;
+    float    reasoning_penalty_repeat     = 1.00f;
+    float    reasoning_penalty_freq       = 0.00f;
+    float    reasoning_penalty_present    = 0.00f;
+    float    reasoning_dry_multiplier     = 0.00f;
+    float    reasoning_dry_base           = 1.75f;
+    int32_t  reasoning_dry_allowed_length = 2;
+    int32_t  reasoning_dry_penalty_last_n = 64;
+    float    reasoning_top_n_sigma        = -1.00f;
+
     bool backend_sampling = false;
 
     // print the parameters into a string
@@ -327,6 +363,7 @@ struct common_params_model {
 struct common_params_speculative_draft {
     int32_t n_max = 3; // maximum number of tokens to draft during speculative decoding
     int32_t n_min = 0; // minimum number of draft tokens to use for speculative decoding
+    int32_t n_min_adaptive = 3; // minimum adaptive MTP draft depth (also the starting depth)
 
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
@@ -426,13 +463,21 @@ struct common_params_speculative {
         return !draft.mparams.empty();
     }
 
+    bool has_mtp() const {
+        return std::any_of(types.begin(), types.end(), [](auto t) {
+            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE;
+        });
+    }
+
     bool has_synth() const {
         return synth_len != -1.0 || !synth_rates.empty();
     }
 
     uint32_t need_n_rs_seq() const {
-        bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
-            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+        bool needs_rs_seq = has_mtp() || std::any_of(types.begin(), types.end(), [](auto t) {
+            return t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 ||
+                   t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH ||
+                   t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
         });
 
         return needs_rs_seq ? draft.n_max : 0u;
@@ -778,6 +823,17 @@ struct common_params {
     bool log_json = false;
 
     std::string slot_save_path;
+    // bounded slot-save store (LRU eviction by mtime; a state file and its .logits/.meta sidecars are
+    // evicted together as one unit). Defaults are finite & sane; 0 means "unlimited" (only if set).
+    int32_t slot_save_max_count = 64;                                // max snapshots in slot_save_path (0 = unlimited)
+    int64_t slot_save_max_bytes = (int64_t) 32 * 1024 * 1024 * 1024; // 32 GiB cap (0 = unlimited)
+    // --- auto disk prompt/KV cache (opt-in, default OFF; see tools/server "auto disk cache") ---
+    // master switch for the transparent cross-process prompt/KV cache. Requires slot_save_path.
+    // When false the whole feature is inert: no startup dir scan, no index, no per-request hashing.
+    bool    slot_save_auto  = false;  // master switch; requires slot_save_path to be set
+    int32_t slot_save_block = 256;    // token-ID hash block size (vLLM-APC / SGLang-radix style)
+                                      // NOTE (BeeLlama): must be a multiple of the KVarN reuse
+                                      // alignment (kvarn.group, 128 by default) when KVarN is active
     std::string media_path; // path to directory for loading media files
 
     float slot_prompt_similarity = 0.1f;

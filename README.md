@@ -160,6 +160,8 @@ cmake --build build -j
 
 The default CUDA FlashAttention build covers 50 standard cache pairs and 15 KVarN fast-decode pairs, including the homogeneous F16 and BF16 pairs needed by precision tails. Add `-DGGML_CUDA_FA_ALL_QUANTS=ON` to compile all 169 standard and 36 KVarN pairs, or `-DGGML_CUDA_KVARN=OFF` to build without KVarN kernels.
 
+For a server-only CUDA build, the full flag mapping, and how to confirm at runtime that a `kvarn4` cache takes the fast decode path, see [docs/build-server-cuda.md](docs/build-server-cuda.md) and `scripts/build-server-cuda.sh`.
+
 ### Other Backends
 
 Bee inherits llama.cpp backend support, including Metal, HIP, Vulkan, SYCL, BLAS, CANN, MUSA, OpenVINO, OpenCL, and RPC. Use the upstream-style build docs in [docs/build.md](docs/build.md) and backend-specific pages under [docs/backend](docs/backend).

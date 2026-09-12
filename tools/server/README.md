@@ -130,6 +130,26 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--top-k N` | top-k sampling (default: 40, 0 = disabled)<br/>(env: LLAMA_ARG_TOP_K) |
 | `--top-p N` | top-p sampling (default: 0.95, 1.0 = disabled) |
 | `--min-p N` | min-p sampling (default: 0.05, 0.0 = disabled) |
+| `--reasoning-temp N` | temperature override while inside the reasoning block; uses the existing sampling chain with continuous RNG and history state (default: inherit) |
+| `--reasoning-top-k N` | top-k override while inside the reasoning block (default: inherit) |
+| `--reasoning-top-p N` | top-p override while inside the reasoning block (default: inherit) |
+| `--reasoning-min-p N` | min-p override while inside the reasoning block (default: inherit) |
+| `--reasoning-top-n-sigma N` | top-n-sigma override while inside the reasoning block (default: inherit) |
+| `--reasoning-xtc-probability N` | XTC probability override while inside the reasoning block (default: inherit) |
+| `--reasoning-xtc-threshold N` | XTC threshold override while inside the reasoning block (default: inherit) |
+| `--reasoning-typical-p N` | locally typical sampling override while inside the reasoning block (default: inherit) |
+| `--reasoning-dynatemp-range N` | dynamic temperature range override while inside the reasoning block (default: inherit) |
+| `--reasoning-dynatemp-exp, --reasoning-dynatemp-exponent N` | dynamic temperature exponent override while inside the reasoning block (default: inherit) |
+| `--reasoning-repeat-last-n N` | repeat history override while inside the reasoning block (default: inherit) |
+| `--reasoning-repeat-penalty N` | repeat-penalty override while inside the reasoning block (default: inherit) |
+| `--reasoning-presence-penalty N` | presence penalty override while inside the reasoning block (default: inherit) |
+| `--reasoning-frequency-penalty N` | frequency penalty override while inside the reasoning block (default: inherit) |
+| `--reasoning-dry-multiplier N` | DRY multiplier override while inside the reasoning block (default: inherit) |
+| `--reasoning-dry-base N` | DRY base override while inside the reasoning block (default: inherit) |
+| `--reasoning-dry-allowed-length N` | DRY allowed length override while inside the reasoning block (default: inherit) |
+| `--reasoning-dry-penalty-last-n N` | DRY history override while inside the reasoning block (default: inherit) |
+| `--reasoning-min-keep N` | minimum candidate count override while inside the reasoning block (default: inherit) |
+| `--reasoning-preserve, --no-reasoning-preserve` | preserve reasoning trace in the full history, not just the last assistant message (default: template default)<br/>compatible with certain templates having 'supports_preserve_reasoning' capability<br/>example: https://docs.z.ai/guides/capabilities/thinking-mode#preserved-thinking<br/>(env: LLAMA_ARG_REASONING_PRESERVE) |
 | `--top-nsigma, --top-n-sigma N` | top-n-sigma sampling (default: -1.00, -1.0 = disabled) |
 | `--xtc-probability N` | xtc probability (default: 0.00, 0.0 = disabled) |
 | `--xtc-threshold N` | xtc threshold (default: 0.10, 1.0 = disabled) |
@@ -226,6 +246,10 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--props` | enable changing global properties via POST /props (default: disabled)<br/>(env: LLAMA_ARG_ENDPOINT_PROPS) |
 | `--slots, --no-slots` | expose slots monitoring endpoint (default: enabled)<br/>(env: LLAMA_ARG_ENDPOINT_SLOTS) |
 | `--slot-save-path PATH` | path to save slot kv cache (default: disabled) |
+| `--slot-save-max-count N` | max number of snapshots kept by the `--slot-save-auto` cache (treated as a dedicated dir); oldest are evicted; no effect without `--slot-save-auto`, manual slot saves never evict (default: 64, 0 = unlimited)<br/>(env: LLAMA_ARG_SLOT_SAVE_MAX_COUNT) |
+| `--slot-save-max-mb N` | max total size (MiB) of the `--slot-save-auto` cache; oldest snapshots are evicted; no effect without `--slot-save-auto`, manual slot saves never evict (default: 32768, 0 = unlimited)<br/>(env: LLAMA_ARG_SLOT_SAVE_MAX_MB) |
+| `--slot-save-auto` | automatically restore/save prompt KV to/from `--slot-save-path` across requests and restarts (transparent disk prompt cache); requires `--slot-save-path` (default: disabled)<br/>(env: LLAMA_ARG_SLOT_SAVE_AUTO) |
+| `--slot-save-block N` | token-ID hash block size for the auto disk cache index; reuse granularity is one block; must be a multiple of 128 (the KVarN descriptor group) when a KVarN cache type is used (default: 256)<br/>(env: LLAMA_ARG_SLOT_SAVE_BLOCK) |
 | `--media-path PATH` | directory for loading local media files; files can be accessed via file:// URLs using relative paths (default: disabled) |
 | `--models-dir PATH` | directory containing models for the router server (default: disabled)<br/>(env: LLAMA_ARG_MODELS_DIR) |
 | `--models-preset PATH` | path to INI file containing model presets for the router server (default: disabled)<br/>(env: LLAMA_ARG_MODELS_PRESET) |
@@ -262,6 +286,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--spec-draft-n-cpu-moe, --spec-draft-ncmoe, -ncmoed, --n-cpu-moe-draft N` | keep the Mixture of Experts (MoE) weights of the first N layers in the CPU for the draft model<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_CPU_MOE) |
 | `--spec-draft-n-max N` | number of tokens to draft for speculative decoding (default: 3)<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_MAX) |
 | `--spec-draft-n-min N` | minimum number of draft tokens to use for speculative decoding (default: 0)<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_MIN) |
+| `--spec-draft-n-min-adaptive N` | minimum adaptive MTP draft depth; the depth starts here and never drops below it (default: 3)<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_MIN_ADAPTIVE) |
 | `--spec-synth-len L` | target mean synthetic acceptance length, including the target token (benchmarking only)<br/>(env: LLAMA_ARG_SPEC_SYNTH_LEN) |
 | `--spec-synth-rates P0,P1,...` | comma-separated unconditional per-position synthetic acceptance probabilities (benchmarking only)<br/>(env: LLAMA_ARG_SPEC_SYNTH_RATES) |
 | `--spec-draft-p-split, --draft-p-split P` | speculative decoding split probability (default: 0.10)<br/>(env: LLAMA_ARG_SPEC_DRAFT_P_SPLIT) |
@@ -270,7 +295,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--spec-draft-device, -devd, --device-draft <dev1,dev2,..>` | comma-separated list of devices to use for offloading the draft model (none = don't offload)<br/>use --list-devices to see a list of available devices |
 | `--spec-draft-ngl, -ngld, --gpu-layers-draft, --n-gpu-layers-draft N` | max. number of draft model layers to store in VRAM, either an exact number, 'auto', or 'all' (default: auto)<br/>(env: LLAMA_ARG_N_GPU_LAYERS_DRAFT) |
 | `--spec-draft-model, -md, --model-draft FNAME` | draft model for speculative decoding (default: unused)<br/>(env: LLAMA_ARG_SPEC_DRAFT_MODEL) |
-| `--spec-type none,draft-simple,draft-eagle3,draft-mtp,draft-dflash,draft-dspark,ngram-simple,ngram-map-k,ngram-map-k4v,ngram-mod,ngram-cache` | comma-separated list of types of speculative decoding to use (default: none)<br/><br/>(env: LLAMA_ARG_SPEC_TYPE) |
+| `--spec-type none,draft-simple,draft-eagle3,draft-mtp,draft-mtp-adaptive,draft-dflash,draft-dspark,ngram-simple,ngram-map-k,ngram-map-k4v,ngram-mod,ngram-cache` | comma-separated list of types of speculative decoding to use (default: none)<br/><br/>(env: LLAMA_ARG_SPEC_TYPE) |
 | `--spec-ngram-mod-n-min N` | minimum number of ngram tokens to use for ngram-based speculative decoding (default: 48) |
 | `--spec-ngram-mod-n-max N` | maximum number of ngram tokens to use for ngram-based speculative decoding (default: 64) |
 | `--spec-ngram-mod-n-match N` | ngram-mod lookup length (default: 24) |
@@ -303,6 +328,10 @@ For the full list of features, please refer to [server's changelog](https://gith
 
 <!-- HELP_END -->
 
+## Reasoning sampling overrides
+
+Supported `--reasoning-*` options switch parameter values in the existing sampler chain while generation is inside a reasoning block. Unset options inherit their base values. RNG, token histories, Mirostat state and adaptive-p state remain continuous. Seed, sampler ordering, Mirostat configuration and adaptive-p configuration cannot vary by reasoning section.
+
 Note: If both command line argument and environment variable are both set for the same param, the argument will take precedence over env var.
 
 For boolean options like `--mmap` or `--kv-offload`, the environment variable is handled as shown in this example:
@@ -328,6 +357,85 @@ services:
       LLAMA_ARG_ENDPOINT_METRICS: 1
       LLAMA_ARG_PORT: 8080
 ```
+
+### Automatic disk prompt cache (`--slot-save-auto`)
+
+`--slot-save-auto` turns `--slot-save-path` into a transparent, cross-process prompt/KV cache.
+It is **off by default**; when off, nothing below runs (no directory scan, no index, no per-request
+hashing) and server behavior is byte-for-byte unchanged.
+
+When on, the server:
+
+1. hashes each request's token IDs in blocks of `--slot-save-block` tokens (chained, so the hash at
+   every block boundary commits to the whole prefix up to that point);
+2. looks the deepest boundary up in an index built from the small `.meta` sidecars in
+   `--slot-save-path` (the multi-GB state file is never opened for a lookup);
+3. **byte-compares** the candidate's persisted token IDs against the request prefix and checks a
+   full model/context fingerprint before restoring anything - the hash alone is never trusted;
+4. persists a slot's KV to disk when the slot is about to lose it (idle-slot flush, or slot reassign
+   when `--cache-idle-slots` is off) - never during generation.
+
+A snapshot is a 3-file unit: `auto-<fp>-<hash>-<n>.bin` (the `llama_state_seq_save_file` state), plus
+`.meta` (token IDs + fingerprint) and, for recurrent/hybrid models only, `.logits` (the last decoded
+token's distribution, used to answer an exact-prompt "regenerate" without re-decoding into a state
+that cannot be rewound). The `<fp>` prefix and the block hashes are salted with the model identity,
+the KV geometry and the draft configuration, so two differently-configured servers can share one
+`--slot-save-path` without overwriting each other's snapshots.
+
+`--slot-save-max-count` / `--slot-save-max-mb` bound the store with an LRU-by-mtime eviction that
+always removes the three files together; a single snapshot larger than the byte cap is rejected
+rather than evicting everything else. **These caps apply only while `--slot-save-auto` is on**: a
+server that only uses the manual `/slots/{id}?action=save` API never evicts anything, whatever the
+caps are set to. With the auto cache on, **point `--slot-save-path` at a dedicated directory** - any
+unrecognized regular file in it is an eviction candidate.
+
+Every failure mode (missing/corrupt file, fingerprint mismatch, I/O error, no match) falls back to a
+normal prefill. A stale cache can never produce wrong output, only a wasted lookup.
+
+#### Fingerprint: what invalidates the cache
+
+A snapshot is only reused by a server whose fingerprint matches exactly. The fingerprint covers the
+model identity (description, size, parameter count, vocab, `n_ctx_train`, `n_embd`, `n_layer`,
+rope type), the effective context (`n_ctx`, rope base/scale, all YaRN parameters), the LoRA set,
+whether `--mmproj` is loaded, `--slot-save-block`, the memory module's sequence-removal class, and -
+specific to BeeLlama - everything that changes KV geometry:
+
+* `--cache-type-k` / `--cache-type-v`, including the KVarN pseudo-types (`kvarn2` ... `kvarn8`) and
+  the derived KVarN descriptor (type, key/value bit widths, SWA key/value bit widths, group,
+  Sinkhorn iterations, sink tokens);
+* the KV precision tail: `--kv-tail-tokens` and `--kv-tail-type`;
+* `--swa-full`, `--kv-unified` and the per-slot unified context size;
+* `-b` / `-ub` / `-np` (KVarN bakes batch geometry into its stage/record ring depth);
+* the speculative configuration: draft type(s), draft model path, draft cache types, the draft KVarN
+  descriptor, and whether the draft owns its own KV cache.
+
+Change any of these and old snapshots are simply ignored (they stay on disk until the LRU reaps them).
+
+#### BeeLlama-specific restrictions
+
+* **Owned speculative draft caches are excluded.** `llama_state_seq_save_file` persists the *target*
+  context only, so a slot whose draft owns its own K/V cache (`--draft-dflash`, `--draft-mtp`,
+  EAGLE3, and any draft-model mode that allocates a draft cache) never auto-saves and never
+  auto-restores. The server logs a single warning the first time such a slot is skipped. Everything
+  else - including n-gram drafting, which has no draft KV cache - works normally.
+* **KVarN reuse is group-aligned.** KVarN can only roll a sequence back to a descriptor-group
+  boundary. The group is fixed at 128 tokens (it is not configurable), so when a KVarN cache type is
+  used `--slot-save-block` must be a multiple of 128; the server refuses to start otherwise. A
+  further consequence: a snapshot whose token count is not a multiple of 128 gets no context
+  checkpoint rebuilt after an auto-restore, so a later rewind of that sequence depends on the live
+  rollback plan and may simply fall back to a normal prefill.
+* **Non-`PART` memory restores whole snapshots only.** For recurrent/hybrid memory (`FULL`) and for
+  KVarN (`RS`, bounded group-aligned rollback), a snapshot is restored only when the entire snapshot
+  is a verified prefix of the request. A request that diverges *inside* a snapshot falls back to a
+  normal prefill instead of attempting a rollback the memory module cannot perform. Standard
+  attention caches (`PART`) always restore the whole snapshot too, and then roll the diverging
+  suffix back per-token; the block-boundary clamp on that path is only a reuse-margin heuristic
+  deciding whether the load is worth paying for, not a bound on what is restored.
+* **Multimodal turns are never persisted.** A prompt containing any image/audio chunk is skipped in
+  both directions, since token IDs cannot identify media content. Text-only turns on an `--mmproj`
+  server are cached normally, but in a store disjoint from a text-only server's.
+* **`--kv-unified` with several parallel slots.** KVarN refuses a per-sequence snapshot while another
+  logical sequence owns the shared stream; such saves simply fail and are skipped.
 
 ### Multimodal support
 
@@ -522,6 +630,8 @@ These words will not be included in the completion, so make sure to add them to 
 `n_probs`: If greater than 0, the response also contains the probabilities of top N tokens for each generated token given the sampling settings. Note that for temperature < 0 the tokens are sampled greedily but token probabilities are still being calculated via a simple softmax of the logits without considering any other sampler settings. Default: `0`
 
 `min_keep`: If greater than 0, force samplers to return N possible tokens at minimum. Default: `0`
+
+`reasoning_*`: Supported reasoning overrides switch parameter values in the existing sampler chain while generation is inside the model's reasoning (thinking) block; outside of it the base values above are used. RNG, token histories, Mirostat state and adaptive-p state remain continuous. Unset reasoning values inherit their base values. Seed, sampler ordering, Mirostat configuration and adaptive-p configuration cannot vary by reasoning section. Supported fields are `reasoning_temp` (alias `reasoning_temperature`), `reasoning_top_k`, `reasoning_top_p`, `reasoning_min_p`, `reasoning_top_n_sigma`, `reasoning_xtc_probability`, `reasoning_xtc_threshold`, `reasoning_typical_p`, `reasoning_dynatemp_range`, `reasoning_dynatemp_exponent`, `reasoning_repeat_last_n`, `reasoning_repeat_penalty`, `reasoning_presence_penalty`, `reasoning_frequency_penalty`, `reasoning_dry_multiplier`, `reasoning_dry_base`, `reasoning_dry_allowed_length`, `reasoning_dry_penalty_last_n` and `reasoning_min_keep`. The overrides require the reasoning start/end tags to be known: on `/v1/chat/completions` they are picked up automatically from chat templates with thinking support, while `/completion` requests must also provide `reasoning_budget_start_tag` and `reasoning_budget_end_tag`; without tags the overrides are ignored (a warning is logged). Default: inherit
 
 `t_max_predict_ms`: Set a time limit in milliseconds for the prediction (a.k.a. text-generation) phase. The timeout will trigger if the generation takes more than the specified time (measured since the first token was generated) and if a new-line character has already been generated. Useful for FIM applications. Default: `0`, which is disabled.
 

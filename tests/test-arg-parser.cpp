@@ -39,7 +39,7 @@ static std::string capture_stderr(const std::function<void()> & fn) {
     const int stderr_fd = fileno(stderr);
     const int saved_fd  = dup(stderr_fd);
     assert(saved_fd >= 0);
-    assert(dup2(fileno(capture), stderr_fd) == 0);
+    assert(dup2(fileno(capture), stderr_fd) == stderr_fd);
 #endif
 
     fn();
@@ -56,7 +56,7 @@ static std::string capture_stderr(const std::function<void()> & fn) {
     assert(_dup2(saved_fd, stderr_fd) == 0);
     _close(saved_fd);
 #else
-    assert(dup2(saved_fd, stderr_fd) == 0);
+    assert(dup2(saved_fd, stderr_fd) == stderr_fd);
     close(saved_fd);
 #endif
     fclose(capture);
@@ -822,6 +822,23 @@ static void test(void) {
         assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), synth_params, LLAMA_EXAMPLE_SERVER));
     }
 
+    // the adaptive floor defaults to 3 and parses explicitly; values below 1 are rejected
+    argv = {"binary_name", "-m", "model_file.gguf"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
+    assert(params.speculative.draft.n_min_adaptive == 3);
+    argv = {"binary_name", "-m", "model_file.gguf", "--spec-draft-n-min-adaptive", "5"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
+    assert(params.speculative.draft.n_min_adaptive == 5);
+    argv = {"binary_name", "-m", "model_file.gguf", "--spec-draft-n-min-adaptive", "0"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
+
+    // the adaptive MTP type parses to the dedicated enum value
+    argv = {"binary_name", "-m", "model_file.gguf", "--spec-type", "draft-mtp-adaptive"};
+    common_params spec_params;
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), spec_params, LLAMA_EXAMPLE_SPECULATIVE));
+    assert(std::find(spec_params.speculative.types.begin(), spec_params.speculative.types.end(),
+                     COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE) != spec_params.speculative.types.end());
+
     argv = {"binary_name", "-m", "model_file.gguf", "-lm", "none"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.load_mode == LLAMA_LOAD_MODE_NONE);
@@ -845,6 +862,53 @@ static void test(void) {
     argv = {"binary_name", "-m", "model_file.gguf", "-lm", "dio"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.load_mode == LLAMA_LOAD_MODE_DIRECT_IO);
+
+    common_params reasoning_params;
+    argv = {
+        "binary_name",
+        "--model", "model_file.gguf",
+        "--reasoning-temp", "1.25",
+        "--reasoning-top-k", "17",
+        "--reasoning-presence-penalty", "-0.2",
+        "--reasoning-frequency-penalty", "0.4",
+        "--reasoning-dry-multiplier", "0.8",
+        "--reasoning-xtc-probability", "0.3",
+        "--reasoning-xtc-threshold", "0.2",
+        "--reasoning-min-keep", "3",
+    };
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), reasoning_params, LLAMA_EXAMPLE_COMPLETION));
+    assert(reasoning_params.sampling.reasoning_temp == 1.25f);
+    assert(reasoning_params.sampling.reasoning_top_k == 17);
+    assert(reasoning_params.sampling.reasoning_penalty_present == -0.2f);
+    assert(reasoning_params.sampling.reasoning_penalty_freq == 0.4f);
+    assert(reasoning_params.sampling.reasoning_dry_multiplier == 0.8f);
+    assert(reasoning_params.sampling.reasoning_xtc_probability == 0.3f);
+    assert(reasoning_params.sampling.reasoning_xtc_threshold == 0.2f);
+    assert(reasoning_params.sampling.reasoning_min_keep == 3);
+    assert(reasoning_params.sampling.reasoning_sampling != 0);
+
+    {
+        const auto ctx_arg = common_params_parser_init(reasoning_params, LLAMA_EXAMPLE_COMPLETION);
+        std::unordered_set<std::string> reasoning_args;
+        for (const auto & opt : ctx_arg.options) {
+            const auto opt_args = opt.get_args();
+            reasoning_args.insert(opt_args.begin(), opt_args.end());
+        }
+
+        const std::vector<std::string> removed_args = {
+            "--reasoning-mirostat",
+            "--reasoning-mirostat-ent",
+            "--reasoning-mirostat-tau",
+            "--reasoning-mirostat-lr",
+            "--reasoning-mirostat-eta",
+            "--reasoning-adaptive-target",
+            "--reasoning-adaptive-decay",
+            "--reasoning-seed",
+        };
+        for (const auto & arg : removed_args) {
+            assert(reasoning_args.find(arg) == reasoning_args.end());
+        }
+    }
 
     // multi-value args (CSV)
     params = common_params();

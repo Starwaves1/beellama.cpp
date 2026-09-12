@@ -231,6 +231,34 @@ behavior. The `--spec-dm-*` rows are Bee server additions.
 | `--spec-dm-profit-warmup N` | `LLAMA_ARG_SPEC_DM_PROFIT_WARMUP` | `0` | Sets measured samples for each initial positive-depth probe. `0` uses `--spec-dm-profit-min-samples`; range: `0` to `64`. |
 | `--spec-dm-profit-baseline-interval N` | `LLAMA_ARG_SPEC_DM_PROFIT_BASELINE_INTERVAL` | `1024` | Sets active controller cycles between no-spec baseline probes. `0` disables periodic probes; range: `0` to `4096`. |
 
+### Adaptive MTP draft depth
+
+`--spec-type draft-mtp-adaptive` is supported. It runs the same MTP drafting
+path as `draft-mtp`, but the draft depth is chosen per sequence by an upstream
+hysteresis controller that climbs after consecutive full accepts and drops
+under accumulated miss pressure. The depth stays inside
+`[--spec-draft-n-min-adaptive, --spec-draft-n-max]`, and the depth learned for
+one generation is reset when a new generation begins. With the defaults
+(`--spec-draft-n-max 3`, `--spec-draft-n-min-adaptive 3`) the floor equals the
+ceiling and the depth is effectively fixed, so raise `--spec-draft-n-max` above
+`3` (upstream recommends `12`) to give the controller room to climb.
+
+| Argument | Env var | Default | Behavior |
+|---|---|---|---|
+| `--spec-type draft-mtp-adaptive` | `LLAMA_ARG_SPEC_TYPE` | `none` | Enables MTP drafting with the adaptive depth controller. Cannot be combined with `draft-mtp`. |
+| `--spec-draft-n-min-adaptive N` | `LLAMA_ARG_SPEC_DRAFT_N_MIN_ADAPTIVE` | `3` | Sets the adaptive depth floor and the starting depth. Must be in `[1, --spec-draft-n-max]`; `--spec-draft-n-max` may itself be capped by the model's MTP layer count, and a floor above that model cap is clamped down to it with a warning instead of failing. `--spec-draft-n-min` is ignored in this mode. |
+
+Like `draft-mtp`, this type owns its draft KV context, so the KVarN draft cache
+presets apply: `--spec-draft-type-k kvarnN` and `--spec-draft-type-v kvarnN`
+work exactly as they do for `draft-mtp`.
+
+The Bee DFlash1 profit adaptive draft-max controller
+(`--spec-dm-controller`, `tools/server/server-adaptive-dm.h`) and this adaptive
+depth never engage together: the Bee controller is offered only by the DFlash
+speculative implementation, and the MTP adaptive depth is additionally clamped
+by the per-call bound the server passes down, so a depth limit set by the
+server always wins.
+
 ## Reasoning loop guard
 
 | Argument | Env var | Default | Behavior |

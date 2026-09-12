@@ -20,14 +20,31 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
 #include <cinttypes>
 #include <exception>
 #include <memory>
 #include <filesystem>
+#include <mutex>
+#include <optional>
 #include <random>
+#include <set>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <fstream>
+
+#ifndef _WIN32
+#include <unistd.h> // getpid() for per-writer-unique temp filenames (cross-process atomicity)
+#else
+#include <process.h> // _getpid()
+#define getpid _getpid
+#endif
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -278,6 +295,636 @@ struct server_batch {
     }
 };
 
+// --- KV restore-reuse: logits sidecar -------------------------------------------
+// When a slot's full state is saved to disk (SLOT_SAVE) for a recurrent/hybrid (FULL) model,
+// we additionally persist the last decoded token's full-vocab logits in a small sidecar file
+// (<state>.logits). On SLOT_RESTORE of an exact-prompt "regenerate" request, those logits let
+// the server emit the first token WITHOUT re-decoding into the (un-rewindable) restored
+// recurrent state - which would otherwise crash. The sidecar is independent of libllama's
+// state-file format (so that format is left untouched) and is purely best-effort: any
+// missing/corrupt/vocab-mismatched sidecar degrades gracefully to the existing behavior.
+static constexpr uint32_t SLOT_LOGITS_MAGIC   = 0x474C4B4Cu; // "LKLG" (llama kv logits), LE
+static constexpr uint32_t SLOT_LOGITS_VERSION = 1u;
+
+static std::string slot_logits_sidecar_path(const std::string & state_filepath) {
+    return state_filepath + ".logits";
+}
+
+static std::string slot_meta_sidecar_path(const std::string & state_filepath) {
+    return state_filepath + ".meta";
+}
+
+// Best-effort "touch": bump the mtime of an auto-cache snapshot's 3-file unit (state + .logits +
+// .meta) to now, so a snapshot that is REUSED (read/restored) but never rewritten is treated as
+// recently-used by the mtime LRU. Without this, the LRU is least-recently-WRITTEN, which would
+// evict a hot base snapshot that N forked requests keep restoring from (it never gets rewritten).
+// Never throws and never errors out the caller: every failure is swallowed via error_code.
+static void auto_touch_unit(const std::string & state_filepath) {
+    const auto now = std::filesystem::file_time_type::clock::now();
+    std::error_code ec;
+    std::filesystem::last_write_time(state_filepath, now, ec);
+    std::filesystem::last_write_time(slot_logits_sidecar_path(state_filepath), now, ec);
+    std::filesystem::last_write_time(slot_meta_sidecar_path(state_filepath), now, ec);
+}
+
+// Best-effort write of the logits sidecar. Returns the number of bytes written (0 on failure or
+// when there is nothing valid to write). Never throws. The file is written to a temp path and
+// atomically renamed so a partial/interrupted write can never leave a corrupt sidecar in place.
+// Fields are serialized byte-by-byte little-endian (not a raw struct fwrite) for portability;
+// the float payload is documented LE-only, matching llama.cpp's native-LE state-file contract.
+static size_t slot_logits_write(const std::string & state_filepath,
+                                const std::vector<float> & logits,
+                                int32_t n_vocab,
+                                uint32_t n_tokens) {
+    if (logits.empty() || (int32_t) logits.size() != n_vocab || n_vocab <= 0) {
+        return 0;
+    }
+    const std::string sidecar = slot_logits_sidecar_path(state_filepath);
+    const std::string tmp     = sidecar + ".tmp";
+
+    std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+    if (!f) {
+        return 0;
+    }
+    auto put_u32 = [&](uint32_t v) {
+        const unsigned char b[4] = {
+            (unsigned char)( v        & 0xFF),
+            (unsigned char)((v >> 8)  & 0xFF),
+            (unsigned char)((v >> 16) & 0xFF),
+            (unsigned char)((v >> 24) & 0xFF),
+        };
+        f.write((const char *) b, 4);
+    };
+    put_u32(SLOT_LOGITS_MAGIC);
+    put_u32(SLOT_LOGITS_VERSION);
+    put_u32((uint32_t) n_vocab);
+    put_u32(n_tokens);
+    f.write((const char *) logits.data(), (std::streamsize) logits.size() * sizeof(float));
+    f.flush();
+    if (!f.good()) {
+        f.close();
+        std::error_code ec;
+        std::filesystem::remove(tmp, ec);
+        return 0;
+    }
+    f.close();
+    std::error_code ec;
+    std::filesystem::rename(tmp, sidecar, ec); // atomic replace
+    if (ec) {
+        std::filesystem::remove(tmp, ec);
+        return 0;
+    }
+    return 16 + logits.size() * sizeof(float);
+}
+
+// Read a logits sidecar. Returns true and fills `out` (size n_vocab) iff a valid sidecar exists
+// whose vocab matches `expect_n_vocab` AND whose recorded token count matches `expect_n_tokens`
+// (the count of the state just restored). The token-count check is AUTHORITATIVE: it binds the
+// sidecar to the exact state it was saved against. Any mismatch / short read / missing file =>
+// false with `out` cleared, so the caller falls back to existing behavior. Never throws.
+static bool slot_logits_read(const std::string & state_filepath,
+                             int32_t expect_n_vocab,
+                             uint32_t expect_n_tokens,
+                             std::vector<float> & out) {
+    out.clear();
+    if (expect_n_vocab <= 0) {
+        return false;
+    }
+    const std::string sidecar = slot_logits_sidecar_path(state_filepath);
+    std::ifstream f(sidecar, std::ios::binary);
+    if (!f) {
+        return false;
+    }
+    auto get_u32 = [&](uint32_t & v) -> bool {
+        unsigned char b[4];
+        f.read((char *) b, 4);
+        if (f.gcount() != 4) {
+            return false;
+        }
+        v = (uint32_t) b[0] | ((uint32_t) b[1] << 8) | ((uint32_t) b[2] << 16) | ((uint32_t) b[3] << 24);
+        return true;
+    };
+    uint32_t magic = 0, version = 0, n_vocab = 0, n_tokens = 0;
+    if (!get_u32(magic) || !get_u32(version) || !get_u32(n_vocab) || !get_u32(n_tokens)) {
+        return false;
+    }
+    if (magic != SLOT_LOGITS_MAGIC || version != SLOT_LOGITS_VERSION ||
+        (int32_t) n_vocab != expect_n_vocab || n_tokens != expect_n_tokens) {
+        return false;
+    }
+    out.resize(n_vocab);
+    const std::streamsize want = (std::streamsize) n_vocab * (std::streamsize) sizeof(float);
+    f.read((char *) out.data(), want);
+    if (f.gcount() != want) {
+        out.clear();
+        return false;
+    }
+    return true;
+}
+
+// --- KV restore-reuse: bounded slot-save store ----------------------------------
+// One slot-save snapshot = a state file plus its optional <name>.logits sidecar and (for auto-cache
+// snapshots) its <name>.meta sidecar; all are always evicted together as a single unit, keyed by
+// the state file's mtime (LRU).
+struct slot_save_unit {
+    std::string state_path;
+    std::string sidecar_path; // "<state>.logits", "" if none
+    std::string meta_path;    // "<state>.meta",   "" if none (auto disk cache)
+    uintmax_t   bytes = 0;
+    std::filesystem::file_time_type mtime;
+};
+
+// Enforce --slot-save-max-count / --slot-save-max-bytes over `dir` using LRU-by-mtime eviction.
+// `just_written` is the state path that was just saved: it is never evicted, but if it ALONE
+// exceeds the byte cap it is deleted (with its sidecars) and `oversized` is set so the caller can
+// reject the save rather than evict everything else. Operates strictly within `dir`; uses only
+// the error_code std::filesystem overloads so it never throws across the server loop.
+//
+// IMPORTANT: this runs ONLY while the automatic disk cache (--slot-save-auto) is enabled; a manual
+// /slots save never evicts. With the auto cache on and a cap set, --slot-save-path is treated as a
+// server-owned store - any regular file in it (other than recognized "<X>.logits"/"<X>.meta"
+// sidecars and in-flight temporaries) is an eviction candidate, so point --slot-save-auto at a
+// DEDICATED directory.
+static void slot_save_enforce_limits(const std::string & dir,
+                                     int32_t max_count, int64_t max_bytes,
+                                     const std::string & just_written,
+                                     bool & oversized) {
+    oversized = false;
+    if (max_count <= 0 && max_bytes <= 0) {
+        return; // both unlimited
+    }
+
+    std::error_code ec;
+    std::vector<slot_save_unit> units;
+    uintmax_t this_unit_bytes = 0;
+
+    // First pass: enumerate every regular file once and record the full set of paths so we can
+    // tell a real sidecar (sibling of a state file we wrote) from a state file a client happened
+    // to name "foo.logits".
+    std::vector<std::string> all_files;
+    {
+        std::set<std::string> present;
+        for (std::filesystem::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+            std::error_code fec;
+            if (!it->is_regular_file(fec) || fec) {
+                continue;
+            }
+            all_files.push_back(it->path().string());
+            present.insert(all_files.back());
+        }
+
+        for (const std::string & p : all_files) {
+            std::error_code fec;
+            // In-flight temp files are never counted, evicted or reaped (a concurrent save, possibly
+            // in a PEER PROCESS, owns them). The auto-save temp base is "<final>.<pid>.<nonce>.tmp"
+            // and its sidecars are "<base>.logits" / "<base>.meta" (themselves written through
+            // "<base>.logits.tmp" / "<base>.meta.tmp"). Between the three publish renames the
+            // sidecars exist while their base does not, so an "ends with .tmp" test alone would
+            // classify them as orphans and delete a peer's in-flight unit. Match the whole scheme:
+            // anything ending in ".tmp" OR carrying ".tmp." anywhere in its name.
+            const std::string bname = std::filesystem::path(p).filename().string();
+            if ((bname.size() >= 4 && bname.compare(bname.size() - 4, 4, ".tmp") == 0) ||
+                bname.find(".tmp.") != std::string::npos) {
+                continue;
+            }
+            // a "<X>.logits"/"<X>.meta" file is a sidecar ONLY when its state file "<X>" is also
+            // present; it is accounted together with that state file below, so skip it here.
+            if (p.size() >= 7 && p.compare(p.size() - 7, 7, ".logits") == 0 &&
+                present.count(p.substr(0, p.size() - 7))) {
+                continue;
+            }
+            if (p.size() >= 5 && p.compare(p.size() - 5, 5, ".meta") == 0 &&
+                present.count(p.substr(0, p.size() - 5))) {
+                continue;
+            }
+            // reap an ORPHANED sidecar (its state file was evicted/lost): otherwise these silently
+            // accumulate (we never count them) and eat real on-disk space forever.
+            if (p.size() >= 7 && p.compare(p.size() - 7, 7, ".logits") == 0 &&
+                !present.count(p.substr(0, p.size() - 7))) {
+                std::filesystem::remove(p, fec);
+                continue;
+            }
+            if (p.size() >= 5 && p.compare(p.size() - 5, 5, ".meta") == 0 &&
+                !present.count(p.substr(0, p.size() - 5))) {
+                std::filesystem::remove(p, fec);
+                continue;
+            }
+
+            slot_save_unit u;
+            u.state_path = p;
+            u.bytes = std::filesystem::file_size(p, fec);
+            if (fec) {
+                continue;
+            }
+            const std::string side = p + ".logits";
+            if (present.count(side)) {
+                const auto sb = std::filesystem::file_size(side, fec);
+                if (!fec) {
+                    u.sidecar_path = side;
+                    u.bytes += sb;
+                }
+            }
+            const std::string meta = p + ".meta";
+            if (present.count(meta)) {
+                const auto mb = std::filesystem::file_size(meta, fec);
+                if (!fec) {
+                    u.meta_path = meta;
+                    u.bytes += mb;
+                }
+            }
+            u.mtime = std::filesystem::last_write_time(p, fec);
+            if (fec) {
+                continue;
+            }
+
+            if (p == just_written) {
+                this_unit_bytes = u.bytes;
+            }
+            units.push_back(std::move(u));
+        }
+    }
+
+    // a single snapshot larger than the byte cap is rejected: delete only the just-written unit,
+    // do NOT cascade-evict every other (valid) snapshot to make room for something that can't fit.
+    if (max_bytes > 0 && this_unit_bytes > (uintmax_t) max_bytes) {
+        for (const auto & u : units) {
+            if (u.state_path == just_written) {
+                std::filesystem::remove(u.state_path, ec);
+                if (!u.sidecar_path.empty()) {
+                    std::filesystem::remove(u.sidecar_path, ec);
+                }
+                if (!u.meta_path.empty()) {
+                    std::filesystem::remove(u.meta_path, ec);
+                }
+                break;
+            }
+        }
+        oversized = true;
+        return;
+    }
+
+    std::sort(units.begin(), units.end(),
+              [](const slot_save_unit & a, const slot_save_unit & b) { return a.mtime < b.mtime; }); // oldest first
+
+    size_t    count = units.size();
+    uintmax_t total = 0;
+    for (const auto & u : units) {
+        total += u.bytes;
+    }
+    size_t idx = 0;
+
+    auto evict_oldest = [&]() -> bool {
+        while (idx < units.size() && units[idx].state_path == just_written) {
+            idx++; // never evict the snapshot we just wrote
+        }
+        if (idx >= units.size()) {
+            return false;
+        }
+        const auto & u = units[idx];
+        std::filesystem::remove(u.state_path, ec);
+        if (!u.sidecar_path.empty()) {
+            std::filesystem::remove(u.sidecar_path, ec);
+        }
+        if (!u.meta_path.empty()) {
+            std::filesystem::remove(u.meta_path, ec);
+        }
+        total -= std::min(total, (uintmax_t) u.bytes);
+        count = (count > 0) ? count - 1 : 0;
+        idx++;
+        return true;
+    };
+
+    if (max_count > 0) {
+        while (count > (size_t) max_count) {
+            if (!evict_oldest()) {
+                break;
+            }
+        }
+    }
+    if (max_bytes > 0) {
+        while (total > (uintmax_t) max_bytes) {
+            if (!evict_oldest()) {
+                break;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --- Auto disk prompt/KV cache (opt-in: --slot-save-auto) ---
+//
+// Persists per-slot KV snapshots to disk (state file + '.meta' [tokens + fingerprint]
+// + '.logits' sidecar) and indexes them by a chained hash over token IDs, so a cold
+// process can reuse a warm process's KV with no client/router involvement.
+//
+// Design invariants (all must hold; comments below reference them by number):
+//   1. Off by default: every hook's FIRST statement is auto_cache_enabled(); when
+//      false there is no scan, index, hashing, or allocation - behavior is unchanged.
+//   2. Never restore on hash alone: the snapshot's token-ID array must byte-compare
+//      equal to the request prefix before any restore (collision-safe).
+//   3. Model identity: each snapshot carries a fingerprint (model/vocab/ctx/rope/
+//      KV-type/KVarN geometry/KV-tail/draft/FULL-vs-attention/LoRA); a mismatch
+//      refuses the restore.
+//   4. Fallback totality: any failure (corrupt file, fp/vocab mismatch, IO error,
+//      no match) falls back to a normal prefill - never crash, never wrong output.
+//   5. Hot-path purity: the multi-GB save runs only on slot release/reassign, never
+//      during generation; restore happens once before prefill.
+//
+// BeeLlama-specific restrictions (see tools/server/README.md):
+//   - a slot with an OWNED speculative draft cache (slot.draft_owns_state) is excluded
+//     entirely: llama_state_seq_save_file persists only the target context, so a
+//     restored target would be paired with a stale/empty draft cache.
+//   - KVarN prefix reuse is only legal at descriptor-group boundaries, so
+//     --slot-save-block must be a multiple of kvarn.group (checked in common/arg.cpp),
+//     and a snapshot is only restored when it is a whole verified prefix of the request
+//     unless the memory module supports arbitrary partial rollback (PART).
+//
+// Concurrency: all slot work runs on the single server-loop thread, so the index is
+// single-threaded and the mutex below is uncontended today; it becomes load-bearing
+// only if the save I/O is later moved to a worker thread.
+// ---------------------------------------------------------------------------
+
+static constexpr uint32_t SLOT_META_MAGIC   = 0x544D4B4Cu; // "LKMT" (llama kv meta), LE
+// version 2 (BeeLlama): adds fp_bee_kv / fp_bee_dft to the fingerprint. Snapshots written by
+// version 1 (upstream layout) are rejected by the version check, not silently mis-read.
+static constexpr uint32_t SLOT_META_VERSION = 2u;
+
+// 64-bit chained block hash over token IDs. Each token folds via FNV-1a then a
+// splitmix avalanche; block k's output seeds block k+1, so the hash at every block
+// boundary commits to the ENTIRE prefix [0, (k+1)*B). Collision resistance is only
+// a candidate-narrowing accelerator: we NEVER trust it alone (invariant 2).
+static inline uint64_t auto_hash_mix(uint64_t h, int32_t tok) {
+    h ^= (uint64_t) (uint32_t) tok;
+    h *= 0x100000001b3ULL;                                  // FNV-1a 64-bit prime
+    h ^= h >> 29; h *= 0xbf58476d1ce4e5b9ULL; h ^= h >> 32; // splitmix64 finalize
+    return h;
+}
+
+static inline uint64_t auto_hash_str(uint64_t h, const std::string & s) {
+    for (char c : s) {
+        h ^= (uint64_t) (unsigned char) c;
+        h *= 0x100000001b3ULL;
+    }
+    return h;
+}
+
+static inline uint64_t auto_hash_f32(uint64_t h, float v) {
+    uint32_t u;
+    std::memcpy(&u, &v, sizeof(u));
+    return auto_hash_mix(h, (int32_t) u);
+}
+
+// Model/quant/context fingerprint that MUST match for a restore to be sound. All
+// fields are stable inference-affecting identity captured once at model load and
+// compared by exact equality (pure-CPU int compares). See invariant 3. The blob
+// produced by llama_state_seq_save_file is only safe to load into a context with
+// identical KV geometry - a Q4_0-KV blob loaded into an F16 ctx, or a different
+// rope/yarn scale (positions are baked into the saved state), silently corrupts -
+// so cache_type_k/v, the KVarN descriptor and rope_scale are NOT optional.
+struct model_fp {
+    uint64_t fp_model      = 0; // hash of llama_model_desc + size + n_params
+    uint32_t fp_n_vocab    = 0;
+    uint32_t fp_n_ctx_train= 0;
+    uint32_t fp_n_embd     = 0;
+    uint32_t fp_n_layer    = 0;
+    uint32_t fp_rope_type  = 0;
+    uint32_t fp_cache_k    = 0; // ggml_type of K cache (enum int)
+    uint32_t fp_cache_v    = 0; // ggml_type of V cache (enum int)
+    uint32_t fp_n_ctx      = 0; // effective per-seq n_ctx
+    uint32_t fp_kv_full    = 0; // seq-rm capability class of the target context (enum int)
+    uint32_t fp_block      = 0; // slot_save_block this snapshot was hashed with
+    uint64_t fp_rope_scale = 0; // bit-pattern of effective rope_freq_scale (position-critical)
+    uint64_t fp_rope_base       = 0; // bit-pattern of effective rope_freq_base
+    uint32_t fp_yarn_ext        = 0; // bit-pattern of yarn_ext_factor
+    uint32_t fp_yarn_attn       = 0; // bit-pattern of yarn_attn_factor
+    uint32_t fp_yarn_beta_fast  = 0; // bit-pattern of yarn_beta_fast
+    uint32_t fp_yarn_beta_slow  = 0; // bit-pattern of yarn_beta_slow
+    uint32_t fp_yarn_orig_ctx   = 0; // yarn_orig_ctx (int)
+    uint64_t fp_lora       = 0; // hash of active LoRA-set ids+scales (0 if none)
+    uint32_t fp_mmproj_loaded   = 0; // text-only server vs --mmproj server get disjoint stores
+
+    // --- BeeLlama additions (see auto_compute_fingerprint) ---
+    // fp_bee_kv:  every knob that changes the TARGET KV geometry or the on-disk KVarN state
+    //             layout - KVarN type/bit widths/group/sinkhorn/sink, the standard+SWA KVarN
+    //             bit intents, the KV precision tail (--kv-tail-tokens/--kv-tail-type),
+    //             swa_full, kv_unified(+per-slot), and the batch/ubatch/parallel geometry that
+    //             KVarN bakes into stage_groups/tail_groups.
+    // fp_bee_dft: the speculative-draft identity (draft model path, draft cache types, draft
+    //             KVarN descriptor, speculative types, and whether the draft owns its own KV).
+    //             A snapshot is never written for a draft-owning slot, but the draft still
+    //             changes what a restored target may legally be paired with, so it is identity.
+    uint64_t fp_bee_kv  = 0;
+    uint64_t fp_bee_dft = 0;
+
+    // exact field-by-field equality (C++17: no defaulted operator==). Any difference REFUSES the
+    // restore (invariant 3). Note: fp_block is intentionally part of identity.
+    bool operator==(const model_fp & o) const {
+        return fp_model == o.fp_model && fp_n_vocab == o.fp_n_vocab &&
+               fp_n_ctx_train == o.fp_n_ctx_train && fp_n_embd == o.fp_n_embd &&
+               fp_n_layer == o.fp_n_layer && fp_rope_type == o.fp_rope_type &&
+               fp_cache_k == o.fp_cache_k && fp_cache_v == o.fp_cache_v &&
+               fp_n_ctx == o.fp_n_ctx && fp_kv_full == o.fp_kv_full &&
+               fp_block == o.fp_block && fp_rope_scale == o.fp_rope_scale &&
+               fp_rope_base == o.fp_rope_base && fp_yarn_ext == o.fp_yarn_ext &&
+               fp_yarn_attn == o.fp_yarn_attn && fp_yarn_beta_fast == o.fp_yarn_beta_fast &&
+               fp_yarn_beta_slow == o.fp_yarn_beta_slow && fp_yarn_orig_ctx == o.fp_yarn_orig_ctx &&
+               fp_lora == o.fp_lora && fp_mmproj_loaded == o.fp_mmproj_loaded &&
+               fp_bee_kv == o.fp_bee_kv && fp_bee_dft == o.fp_bee_dft;
+    }
+};
+
+// Returns, for each block boundary b in [1 .. n/B], the cumulative chain hash
+// committing to tokens[0 .. b*B). out[k] = hash of prefix length (k+1)*B. The
+// chain is salted with `salt` (auto_name_salt(): model identity + KV geometry + draft
+// configuration) so two different models - or two differently-configured servers sharing
+// one --slot-save-path - can never produce the same boundary hash for identical tokens. A trailing
+// partial block is NOT a boundary (only whole-block prefixes are index keys).
+static std::vector<uint64_t> auto_block_hashes(const llama_tokens & toks, int B, uint64_t salt) {
+    std::vector<uint64_t> out;
+    if (B <= 0) {
+        return out;
+    }
+    out.reserve(toks.size() / (size_t) B);
+    uint64_t h = 0xcbf29ce484222325ULL ^ salt; // FNV offset basis, fingerprint-salted
+    for (size_t i = 0; i < toks.size(); ++i) {
+        h = auto_hash_mix(h, toks[i]);
+        if ((i + 1) % (size_t) B == 0) {
+            out.push_back(h);
+        }
+    }
+    return out;
+}
+
+// One in-memory index entry: the longest snapshot that reaches a given block boundary.
+struct auto_cache_entry {
+    std::string state_path; // full state file path (sidecars derived via *_path helpers)
+    uint32_t    n_tokens = 0;
+    model_fp    fp;         // snapshot's fingerprint (must equal the live one to be used)
+};
+
+// boundary-hash -> best (longest) entry covering that prefix length. `scanned`
+// guards the one-time startup scan; `dir_mtime`/`last_refresh` drive the cheap
+// cross-process refresh (see auto_index_refresh_locked).
+struct auto_cache_index {
+    std::mutex mtx;
+    std::unordered_map<uint64_t, auto_cache_entry> by_boundary;
+    std::unordered_set<std::string> indexed_files;    // state paths already scanned (incremental refresh)
+    bool scanned = false;
+    std::filesystem::file_time_type dir_mtime{};      // dir mtime as of the last scan
+    std::chrono::steady_clock::time_point last_refresh{}; // throttle: skip stat storms in a burst
+};
+
+// Cross-process refresh throttle: at most one dir-mtime stat per this interval on the hot lookup
+// path (a forced refresh on a lookup miss bypasses it).
+static constexpr int AUTO_REFRESH_MIN_MS = 1000;
+
+// Best-effort atomic write of the .meta sidecar (LE, temp+rename - the exact idiom
+// of slot_logits_write). Layout: magic/version, fingerprint fields, tok_count,
+// chain_hash, then int32 tokens[tok_count]. Returns true on success. Never throws.
+static bool slot_meta_write(const std::string & state_filepath,
+                            const model_fp & fp,
+                            const llama_tokens & toks,
+                            uint64_t chain_hash) {
+    const std::string sidecar = slot_meta_sidecar_path(state_filepath);
+    const std::string tmp     = sidecar + ".tmp";
+
+    std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+    if (!f) {
+        return false;
+    }
+    auto put_u32 = [&](uint32_t v) {
+        const unsigned char b[4] = {
+            (unsigned char)( v        & 0xFF),
+            (unsigned char)((v >> 8)  & 0xFF),
+            (unsigned char)((v >> 16) & 0xFF),
+            (unsigned char)((v >> 24) & 0xFF),
+        };
+        f.write((const char *) b, 4);
+    };
+    auto put_u64 = [&](uint64_t v) {
+        put_u32((uint32_t)(v & 0xFFFFFFFFu));
+        put_u32((uint32_t)(v >> 32));
+    };
+    put_u32(SLOT_META_MAGIC);
+    put_u32(SLOT_META_VERSION);
+    put_u64(fp.fp_model);
+    put_u32(fp.fp_n_vocab);
+    put_u32(fp.fp_n_ctx_train);
+    put_u32(fp.fp_n_embd);
+    put_u32(fp.fp_n_layer);
+    put_u32(fp.fp_rope_type);
+    put_u32(fp.fp_cache_k);
+    put_u32(fp.fp_cache_v);
+    put_u32(fp.fp_n_ctx);
+    put_u32(fp.fp_kv_full);
+    put_u32(fp.fp_block);
+    put_u64(fp.fp_rope_scale);
+    // rope_freq_base + YaRN fingerprint fields
+    put_u64(fp.fp_rope_base);
+    put_u32(fp.fp_yarn_ext);
+    put_u32(fp.fp_yarn_attn);
+    put_u32(fp.fp_yarn_beta_fast);
+    put_u32(fp.fp_yarn_beta_slow);
+    put_u32(fp.fp_yarn_orig_ctx);
+    put_u64(fp.fp_lora);
+    // mmproj deployment-shape bit - refuses cross-shape restores.
+    put_u32(fp.fp_mmproj_loaded);
+    // BeeLlama: KVarN/KV-tail/batch geometry and the speculative-draft identity.
+    put_u64(fp.fp_bee_kv);
+    put_u64(fp.fp_bee_dft);
+    put_u32((uint32_t) toks.size());
+    put_u64(chain_hash);
+    // token IDs as raw LE int32 (llama_token == int32_t; llama.cpp's on-disk
+    // contract is native-LE, matching slot_logits_write's float payload).
+    f.write((const char *) toks.data(), (std::streamsize) toks.size() * sizeof(int32_t));
+    f.flush();
+    if (!f.good()) {
+        f.close();
+        std::error_code ec;
+        std::filesystem::remove(tmp, ec);
+        return false;
+    }
+    f.close();
+    std::error_code ec;
+    std::filesystem::rename(tmp, sidecar, ec); // atomic replace
+    if (ec) {
+        std::filesystem::remove(tmp, ec);
+        return false;
+    }
+    return true;
+}
+
+// Read a .meta sidecar. Returns true and fills `fp_out` + `toks_out` iff a valid
+// sidecar exists. Any short read / bad magic / version mismatch => false with
+// outputs cleared (invariant 4). Never throws. Note: `chain_hash` is recorded for
+// debuggability but the authority for reuse is always the byte-compared tokens.
+static bool slot_meta_read(const std::string & state_filepath,
+                           model_fp & fp_out,
+                           llama_tokens & toks_out) {
+    fp_out = model_fp{};
+    toks_out.clear();
+    const std::string sidecar = slot_meta_sidecar_path(state_filepath);
+    std::ifstream f(sidecar, std::ios::binary);
+    if (!f) {
+        return false;
+    }
+    auto get_u32 = [&](uint32_t & v) -> bool {
+        unsigned char b[4];
+        f.read((char *) b, 4);
+        if (f.gcount() != 4) {
+            return false;
+        }
+        v = (uint32_t) b[0] | ((uint32_t) b[1] << 8) | ((uint32_t) b[2] << 16) | ((uint32_t) b[3] << 24);
+        return true;
+    };
+    auto get_u64 = [&](uint64_t & v) -> bool {
+        uint32_t lo = 0, hi = 0;
+        if (!get_u32(lo) || !get_u32(hi)) {
+            return false;
+        }
+        v = (uint64_t) lo | ((uint64_t) hi << 32);
+        return true;
+    };
+    uint32_t magic = 0, version = 0;
+    if (!get_u32(magic) || !get_u32(version)) {
+        return false;
+    }
+    if (magic != SLOT_META_MAGIC || version != SLOT_META_VERSION) {
+        return false;
+    }
+    model_fp fp;
+    uint32_t tok_count = 0;
+    uint64_t chain_hash = 0;
+    if (!get_u64(fp.fp_model)         || !get_u32(fp.fp_n_vocab)       || !get_u32(fp.fp_n_ctx_train) ||
+        !get_u32(fp.fp_n_embd)        || !get_u32(fp.fp_n_layer)       || !get_u32(fp.fp_rope_type)   ||
+        !get_u32(fp.fp_cache_k)       || !get_u32(fp.fp_cache_v)       || !get_u32(fp.fp_n_ctx)       ||
+        !get_u32(fp.fp_kv_full)       || !get_u32(fp.fp_block)         || !get_u64(fp.fp_rope_scale)  ||
+        // rope_freq_base + YaRN - must be read in the same order slot_meta_write emits.
+        !get_u64(fp.fp_rope_base)     || !get_u32(fp.fp_yarn_ext)      || !get_u32(fp.fp_yarn_attn)   ||
+        !get_u32(fp.fp_yarn_beta_fast)|| !get_u32(fp.fp_yarn_beta_slow)|| !get_u32(fp.fp_yarn_orig_ctx)||
+        // mmproj deployment-shape bit - read in the same order slot_meta_write emits.
+        !get_u64(fp.fp_lora)          || !get_u32(fp.fp_mmproj_loaded) ||
+        // BeeLlama KV-geometry / draft identity hashes.
+        !get_u64(fp.fp_bee_kv)        || !get_u64(fp.fp_bee_dft)       ||
+        !get_u32(tok_count)           || !get_u64(chain_hash)) {
+        return false;
+    }
+    (void) chain_hash;
+    // sanity-bound the count so a corrupt header cannot make us allocate gigabytes.
+    if (tok_count > (1u << 28)) {
+        return false;
+    }
+    toks_out.resize(tok_count);
+    const std::streamsize want = (std::streamsize) tok_count * (std::streamsize) sizeof(int32_t);
+    f.read((char *) toks_out.data(), want);
+    if (f.gcount() != want) {
+        toks_out.clear();
+        return false;
+    }
+    fp_out = fp;
+    return true;
+}
+
 struct server_slot {
     int id;
 
@@ -297,6 +944,9 @@ struct server_slot {
     llama_tokens spec_draft;
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
+    // batch index of the logits that produced the last ACCEPTED speculative token; recorded before
+    // spec_i_batch is cleared and consumed by slot_capture_logits(). -1 = none pending.
+    int32_t spec_logits_idx = -1;
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
     std::mt19937 spec_synth_rng;
@@ -335,6 +985,22 @@ struct server_slot {
     bool has_next_token = true;
     bool has_new_line   = false;
     bool truncated      = false;
+    bool just_restored  = false; // set on disk slot-restore; one-shot, gates restored-slot KV reuse
+
+    // --- KV restore-reuse (logits sidecar) ---
+    // Full-vocab logits of this slot's most recently sampled (or, under speculative decoding, last
+    // ACCEPTED) token, captured at sample time - only for FULL/recurrent models when
+    // --slot-save-path is set. Serialized to the <state>.logits sidecar on SLOT_SAVE so a later
+    // exact-prompt "regenerate" can emit the first token WITHOUT re-decoding into the
+    // (un-rewindable) restored recurrent state.
+    std::vector<float> logits_last;     // size n_vocab when valid, else empty
+    // Token count of the prompt-state that `logits_last` corresponds to (i.e. the slot's KV/token
+    // length at the moment of capture). Used to BIND the captured distribution to a specific state:
+    // a sidecar is only written when this equals the saved snapshot's token_count, so a stale
+    // distribution can never be serialized against a mismatched state. -1 = no valid capture.
+    int32_t logits_last_n_tokens = -1;
+    // Logits loaded from a sidecar at SLOT_RESTORE, consumed once by the restore-continue path.
+    std::vector<float> restored_logits; // size n_vocab when a valid sidecar was loaded, else empty
 
     stop_type stop;
     std::string stop_detail;
@@ -492,6 +1158,7 @@ struct server_slot {
         if (can_speculate()) {
             spec_draft.clear();
             spec_i_batch.clear();
+            spec_logits_idx = -1;
             spec_ckpt.clear();
         }
         generated_tokens.clear();
@@ -511,6 +1178,13 @@ struct server_slot {
 
         // clear alora start
         alora_invocation_start = -1;
+
+        // one-shot; never carry restored sidecar logits into a non-restore request.
+        // NOTE: logits_last is deliberately NOT cleared here - it is the slot's running
+        // "last sampled distribution" and must survive into the idle state so a subsequent
+        // SLOT_SAVE / auto-save can serialize it.
+        restored_logits.clear();
+        just_restored = false;
 
         // clear multimodal state
         mbatch.reset();
@@ -1095,6 +1769,42 @@ private:
 
     bool sleeping = false;
 
+    // --- auto disk prompt/KV cache (opt-in: --slot-save-auto) ---
+    // Default-constructed: empty and untouched when the feature is OFF (invariant 1).
+    // `cur_fp` is the live model fingerprint, computed once at load (only when enabled).
+    auto_cache_index auto_idx;
+    model_fp         cur_fp;
+    // BeeLlama: the auto cache is refused for slots whose speculative draft owns its own KV
+    // (llama_state_seq_save_file only persists the target context). Warn once, not per request.
+    bool auto_warned_draft_owns_state = false;
+
+    // The ONE gate for the entire auto disk cache. When false, NO hook below does
+    // any work (no scan, no hash, no alloc). This is invariant 1 - the first
+    // statement of every auto_* hook is `if (!auto_cache_enabled()) return;`.
+    bool auto_cache_enabled() const {
+        return params_base.slot_save_auto && !params_base.slot_save_path.empty();
+    }
+
+    // BeeLlama gate (3): a slot with an owned speculative draft cache is excluded entirely from
+    // the auto disk cache, in BOTH directions (no save, no restore). Rationale: the on-disk
+    // snapshot produced by llama_state_seq_save_file(ctx_tgt, ...) contains the TARGET sequence
+    // only. Restoring it would leave slot.ctx_dft holding either an empty or a stale draft
+    // sequence for the same slot id, which the speculative rollback machinery
+    // (restore_checkpoint_transaction / server_speculative_rollback_requires_checkpoint) assumes
+    // is in lockstep with the target. Fail closed rather than persist half a state.
+    bool auto_slot_excluded(const server_slot & slot) {
+        if (!slot.draft_owns_state) {
+            return false;
+        }
+        if (!auto_warned_draft_owns_state) {
+            auto_warned_draft_owns_state = true;
+            LOG_WRN("%s: the auto disk prompt cache (--slot-save-auto) is disabled for slots with an "
+                    "owned speculative draft KV cache; only the target context can be persisted by "
+                    "llama_state_seq_save_file\n", __func__);
+        }
+        return true;
+    }
+
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
@@ -1187,9 +1897,7 @@ private:
 
         const bool has_mmproj = !params.mmproj.path.empty();
         const bool has_draft = params.speculative.has_dft();
-        const bool spec_mtp = std::find(params_base.speculative.types.begin(),
-                                        params_base.speculative.types.end(),
-                                        COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
+        const bool spec_mtp = params_base.speculative.has_mtp();
         const bool has_spec = has_draft || spec_mtp;
 
         if (callback_state) {
@@ -1558,6 +2266,23 @@ private:
         // propagate new defaults back to caller
         params = params_base;
 
+        // AUTO disk prompt/KV cache (invariant 1): compute the model fingerprint and build the
+        // longest-prefix index ONCE, header-only - but ONLY when the feature is enabled. When OFF
+        // this is a single boolean test and nothing else (no fingerprint, no scan, no allocation).
+        if (auto_cache_enabled()) {
+            cur_fp = auto_compute_fingerprint();
+            auto_index_scan();
+            SRV_INF("auto disk prompt cache enabled: indexed %zu prefix boundaries from %s (block = %d, reuse alignment = %d)\n",
+                    auto_idx.by_boundary.size(), params_base.slot_save_path.c_str(),
+                    params_base.slot_save_block, prompt_reuse_alignment());
+            if (params_base.slot_save_block % prompt_reuse_alignment() != 0) {
+                // belt-and-braces: common/arg.cpp already rejects this combination at parse time.
+                SRV_WRN("auto disk prompt cache: --slot-save-block (%d) is not a multiple of the prompt "
+                        "reuse alignment (%d); restores may be refused\n",
+                        params_base.slot_save_block, prompt_reuse_alignment());
+            }
+        }
+
         if (!is_resume) {
             return init();
         }
@@ -1821,6 +2546,19 @@ private:
         }
 
         if (ret) {
+            // Second auto-save site, for when cache_idle_slots is OFF (the idle-flush loop in the
+            // task handler, which calls auto_save_slot_if_useful, never runs then). Here
+            // get_available_slot has just picked `ret` for a new task and `update_cache` signals
+            // its prior KV is about to be discarded, so we persist it before the
+            // prompt_save/prompt_load below overwrites it. Mutually exclusive with the primary site
+            // via !cache_idle_slots, so no double-save. Deliberately reads `update_cache` BEFORE
+            // the `&& prompt_cache` narrowing on the next line, so the disk save also works without
+            // --cache-ram. The callee carries all correctness gates; `ret` is idle so this never
+            // stalls generation.
+            if (auto_cache_enabled() && !params_base.cache_idle_slots && update_cache) {
+                auto_save_slot_if_useful(*ret);
+            }
+
             update_cache = update_cache && prompt_cache;
 
             // cache prompts only for completion tasks
@@ -1896,6 +2634,13 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        // A new task is being assigned to this slot: its prompt may differ from whatever produced
+        // the slot's current `logits_last` (even at the same token count). Invalidate the capture so
+        // a SLOT_SAVE / auto-save issued on the new prompt can never serialize a stale, mismatched
+        // distribution. The stamp is re-established only by a real decode of the new prompt.
+        slot.logits_last.clear();
+        slot.logits_last_n_tokens = -1;
+
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
             auto task_loras = construct_lora_list(task.params.lora);
@@ -2681,6 +3426,13 @@ private:
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
+        // Checkpoints disabled (--ctx-checkpoints 0): nothing may be created. The eviction loop
+        // below would otherwise pop from an empty vector when the cap is 0. Every caller already
+        // guards on this, so this is defensive only and changes no existing behavior.
+        if (params_base.n_ctx_checkpoints <= 0) {
+            return;
+        }
+
         const int id_task = slot.task->id;
 
         const int64_t n_tokens_checkpoint = slot.prompt.n_tokens() - n_tokens_cur;
@@ -2748,6 +3500,672 @@ private:
                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                 (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, admitted.pos_min,
                 admitted.pos_max, admitted.n_tokens, (float) admitted.size() / 1024 / 1024);
+    }
+
+    // ----- KV restore-reuse: capture the last decoded token's full-vocab logits -----
+    // `tok_idx` is the batch index whose logits produced the token that the slot's state ends at.
+    // `stamp` is the slot's token count that this distribution corresponds to; -1 means "the
+    // slot's current prompt token count", which is correct on the ordinary sampling path (the
+    // just-sampled token has not been appended yet). The speculative path must pass an explicit
+    // stamp, because it rewrites prompt.tokens before the capture.
+    //
+    // Only meaningful for FULL/recurrent target contexts (the regenerate fast-path is the only
+    // consumer) and only when slot saving is configured at all; every other server pays nothing.
+    void slot_capture_logits(server_slot & slot, int tok_idx, int32_t stamp = -1) {
+        if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_FULL || params_base.slot_save_path.empty()) {
+            return;
+        }
+        const float * lg = tok_idx >= 0 ? llama_get_logits_ith(slot.ctx_tgt, tok_idx) : nullptr;
+        if (!lg) {
+            // capture failed -> invalidate so a later save never serializes stale logits
+            slot.logits_last.clear();
+            slot.logits_last_n_tokens = -1;
+            return;
+        }
+        const int nv = llama_vocab_n_tokens(llama_model_get_vocab(model_tgt));
+        slot.logits_last.assign(lg, lg + nv);
+        slot.logits_last_n_tokens = stamp >= 0 ? stamp : (int32_t) slot.prompt.tokens.size();
+    }
+
+    // ----- auto disk cache: fingerprint, index, restore, save (all gated by auto_cache_enabled()) -----
+
+    // hash of the active LoRA set (ids/scales) for the fingerprint; 0 when no adapter is active.
+    static uint64_t auto_lora_hash(const std::vector<common_adapter_lora_info> & lora) {
+        uint64_t h = 0xcbf29ce484222325ULL;
+        bool any = false;
+        for (const auto & a : lora) {
+            if (a.scale == 0.0f) {
+                continue; // disabled adapter does not affect inference identity
+            }
+            any = true;
+            h = auto_hash_str(h, a.path);
+            h = auto_hash_f32(h, a.scale);
+        }
+        return any ? h : 0;
+    }
+
+    // BeeLlama (1): every knob that changes the TARGET KV geometry or the on-disk KVarN state
+    // layout. Folded into one 64-bit hash instead of ~20 explicit .meta fields: a change in ANY of
+    // them changes the hash, which is exactly the semantics model_fp::operator== needs. Fields:
+    //   - standard backing cache types (cache_type_k/v are ALSO kept as explicit fp fields)
+    //   - the KVarN descriptor: type, key/value bits, SWA key/value bits, group, sinkhorn iters,
+    //     sink tokens, plus the separate cache_kvarn_bits_* / cache_kvarn_swa_bits_* intents
+    //   - the KV precision tail: --kv-tail-tokens (a string, resolved per model) and --kv-tail-type
+    //   - swa_full / kv_unified / kv_unified_per_slot (SWA + stream-sharing layout)
+    //   - n_batch / n_ubatch / n_parallel: llama_kv_cache_kvarn derives stage_groups / tail_groups /
+    //     n_groups_per_stream from these, and state_read refuses a mismatching stage depth outright
+    //   - n_ctx / n_ctx_checkpoints-independent: n_ctx is already an explicit fp field
+    uint64_t auto_bee_kv_hash() const {
+        uint64_t h = 0xcbf29ce484222325ULL;
+        h = auto_hash_str(h, "beellama-kv-v1");
+        h = auto_hash_mix(h, (int32_t) params_base.cache_type_k);
+        h = auto_hash_mix(h, (int32_t) params_base.cache_type_v);
+        // KVarN descriptor (src/llama-kvarn.h, llama_kvarn_params)
+        h = auto_hash_mix(h, (int32_t) params_base.kvarn.type);
+        h = auto_hash_mix(h, params_base.kvarn.key_bits);
+        h = auto_hash_mix(h, params_base.kvarn.value_bits);
+        h = auto_hash_mix(h, params_base.kvarn.swa_key_bits);
+        h = auto_hash_mix(h, params_base.kvarn.swa_value_bits);
+        h = auto_hash_mix(h, params_base.kvarn.group);
+        h = auto_hash_mix(h, params_base.kvarn.sinkhorn_iters);
+        h = auto_hash_mix(h, params_base.kvarn.sink_tokens);
+        h = auto_hash_mix(h, params_base.cache_kvarn_bits_k);
+        h = auto_hash_mix(h, params_base.cache_kvarn_bits_v);
+        h = auto_hash_mix(h, params_base.cache_kvarn_swa_bits_k);
+        h = auto_hash_mix(h, params_base.cache_kvarn_swa_bits_v);
+        // KV precision tail (--kv-tail-tokens is a per-group spec string, --kv-tail-type an enum)
+        h = auto_hash_str(h, params_base.kv_tail_tokens);
+        h = auto_hash_mix(h, (int32_t) params_base.kv_tail_type);
+        // SWA / stream-sharing layout
+        h = auto_hash_mix(h, params_base.swa_full     ? 1 : 0);
+        h = auto_hash_mix(h, params_base.kv_unified   ? 1 : 0);
+        h = auto_hash_mix(h, params_base.kv_unified_per_slot);
+        // batch geometry: KVarN bakes it into the record/stage ring shape
+        h = auto_hash_mix(h, params_base.n_batch);
+        h = auto_hash_mix(h, params_base.n_ubatch);
+        h = auto_hash_mix(h, params_base.n_parallel);
+        return h;
+    }
+
+    // BeeLlama (1): the speculative-draft identity. A draft-owning slot never writes a snapshot
+    // (auto_slot_excluded), but the draft configuration still determines the KV geometry a
+    // restored target may legally be paired with (and n-gram/MTP draft modes change the target
+    // context's own rs-seq reservations), so it is part of identity.
+    uint64_t auto_bee_dft_hash() const {
+        uint64_t h = 0xcbf29ce484222325ULL;
+        h = auto_hash_str(h, "beellama-dft-v1");
+        for (const auto t : params_base.speculative.types) {
+            h = auto_hash_mix(h, (int32_t) t);
+        }
+        h = auto_hash_str(h, params_base.speculative.draft.mparams.path);
+        h = auto_hash_mix(h, (int32_t) params_base.speculative.draft.cache_type_k);
+        h = auto_hash_mix(h, (int32_t) params_base.speculative.draft.cache_type_v);
+        h = auto_hash_mix(h, params_base.speculative.draft.cache_kvarn_bits_k);
+        h = auto_hash_mix(h, params_base.speculative.draft.cache_kvarn_bits_v);
+        h = auto_hash_mix(h, (int32_t) params_base.speculative.draft.kvarn.type);
+        h = auto_hash_mix(h, params_base.speculative.draft.kvarn.key_bits);
+        h = auto_hash_mix(h, params_base.speculative.draft.kvarn.value_bits);
+        h = auto_hash_mix(h, params_base.speculative.draft.kvarn.swa_key_bits);
+        h = auto_hash_mix(h, params_base.speculative.draft.kvarn.swa_value_bits);
+        h = auto_hash_mix(h, params_base.speculative.draft.kvarn.group);
+        h = auto_hash_mix(h, params_base.speculative.draft.kvarn.sinkhorn_iters);
+        h = auto_hash_mix(h, params_base.speculative.draft.kvarn.sink_tokens);
+        h = auto_hash_mix(h, draft_owns_state ? 1 : 0);
+        return h;
+    }
+
+    // Compute the live model fingerprint once at load (invariant 3). Pure-CPU; only called from
+    // an auto_cache_enabled() branch so it costs nothing when OFF.
+    // See README "Automatic disk prompt cache" for which flags invalidate the cache.
+    model_fp auto_compute_fingerprint() const {
+        model_fp fp;
+        // model identity string (arch + params + quant), hardened with size/n_params.
+        char desc[256] = {0};
+        llama_model_desc(model_tgt, desc, sizeof(desc));
+        uint64_t h = 0xcbf29ce484222325ULL;
+        for (const char * p = desc; *p; ++p) {
+            h ^= (uint64_t) (unsigned char) *p; h *= 0x100000001b3ULL;
+        }
+        const uint64_t sz = llama_model_size(model_tgt);
+        const uint64_t np = llama_model_n_params(model_tgt);
+        h = auto_hash_mix(h, (int32_t) (sz & 0xFFFFFFFFu)); h = auto_hash_mix(h, (int32_t) (sz >> 32));
+        h = auto_hash_mix(h, (int32_t) (np & 0xFFFFFFFFu)); h = auto_hash_mix(h, (int32_t) (np >> 32));
+
+        fp.fp_model       = h;
+        fp.fp_n_vocab     = (uint32_t) llama_vocab_n_tokens(llama_model_get_vocab(model_tgt));
+        fp.fp_n_ctx_train = (uint32_t) llama_model_n_ctx_train(model_tgt);
+        fp.fp_n_embd      = (uint32_t) llama_model_n_embd(model_tgt);
+        fp.fp_n_layer     = (uint32_t) llama_model_n_layer(model_tgt);
+        fp.fp_rope_type   = (uint32_t) llama_model_rope_type(model_tgt);
+        // K/V cache type has no live-ctx getter - capture from the server's own params (the value
+        // used to construct ctx_tgt). Blob-layout-critical: a Q4_0-KV blob into an F16 ctx corrupts.
+        fp.fp_cache_k     = (uint32_t) params_base.cache_type_k;
+        fp.fp_cache_v     = (uint32_t) params_base.cache_type_v;
+        fp.fp_n_ctx       = (uint32_t) llama_n_ctx_seq(ctx_tgt);
+        // BeeLlama: store the full seq-rm capability CLASS, not just FULL-vs-not. KVarN reports
+        // COMMON_CONTEXT_SEQ_RM_TYPE_RS (bounded partial rollback), which is a third behavior and
+        // must not be confused with either PART or FULL when a snapshot is reused.
+        fp.fp_kv_full     = (uint32_t) ctx_tgt_seq_rm_type;
+        fp.fp_block       = (uint32_t) params_base.slot_save_block;
+        // effective rope scale (positions are baked into the saved state). rope_freq_scale==0 means
+        // "use the model's trained value", so fall back to that for a stable comparison.
+        float rs = params_base.rope_freq_scale != 0.0f
+                       ? params_base.rope_freq_scale
+                       : llama_model_rope_freq_scale_train(model_tgt);
+        uint32_t rsb; std::memcpy(&rsb, &rs, sizeof(rsb));
+        fp.fp_rope_scale  = (uint64_t) rsb;
+        // rope_freq_base + the five YaRN params also bake positions into the saved KV, so they MUST
+        // be part of identity. "use-model-default" is normalized to a single canonical 0 sentinel so
+        // two runs that both rely on the model default match; any explicit override refuses.
+        auto bitcast_f = [](float v) -> uint32_t { uint32_t u; std::memcpy(&u, &v, sizeof(u)); return u; };
+        auto norm_yarn = [&](float v) -> uint32_t { return v < 0.0f ? 0u : bitcast_f(v); }; // <0 == model default
+        const float rb = params_base.rope_freq_base > 0.0f ? params_base.rope_freq_base : 0.0f; // 0 == model default
+        uint32_t rbb; std::memcpy(&rbb, &rb, sizeof(rbb));
+        fp.fp_rope_base      = (uint64_t) rbb;
+        fp.fp_yarn_ext       = norm_yarn(params_base.yarn_ext_factor);
+        fp.fp_yarn_attn      = norm_yarn(params_base.yarn_attn_factor);
+        fp.fp_yarn_beta_fast = norm_yarn(params_base.yarn_beta_fast);
+        fp.fp_yarn_beta_slow = norm_yarn(params_base.yarn_beta_slow);
+        fp.fp_yarn_orig_ctx  = params_base.yarn_orig_ctx > 0 ? (uint32_t) params_base.yarn_orig_ctx : 0u;
+        // LoRA: fingerprint the global adapter set so a snapshot under adapter A never restores
+        // under B. (Per-request adapter overrides additionally gate at the restore hook.)
+        fp.fp_lora        = auto_lora_hash(params_base.lora_adapters);
+        // deployment-shape bit (invariant 3): text-only server vs --mmproj server get
+        // disjoint stores (mmproj-aware rope/projector wiring can change the text KV layout).
+        fp.fp_mmproj_loaded = (mctx != nullptr) ? 1u : 0u;
+        // BeeLlama KV geometry + draft identity (see the two helpers above).
+        fp.fp_bee_kv  = auto_bee_kv_hash();
+        fp.fp_bee_dft = auto_bee_dft_hash();
+        return fp;
+    }
+
+    // Name/hash salt for the auto store. Two servers on the SAME model but with different KV
+    // geometry (e.g. --cache-type-k f16 vs kvarn4) or a different draft configuration must not
+    // produce the same file names: they would repeatedly overwrite and evict each other's snapshots
+    // while the fingerprint check correctly refused every restore (fails closed, but thrashes).
+    // Folding the two BeeLlama hashes and the explicit cache types into the salt gives each
+    // configuration its own name space inside one shared --slot-save-path.
+    //
+    // MUST be computed identically at save, index scan and lookup - it salts both the filename
+    // prefix and the block chain hashes, so a mismatch silently splits the index from the store.
+    // It derives only from `cur_fp`, which is computed once at init, so every site agrees.
+    uint64_t auto_name_salt() const {
+        uint64_t h = cur_fp.fp_model;
+        h = auto_hash_mix(h, (int32_t) (cur_fp.fp_bee_kv  & 0xFFFFFFFFu));
+        h = auto_hash_mix(h, (int32_t) (cur_fp.fp_bee_kv  >> 32));
+        h = auto_hash_mix(h, (int32_t) (cur_fp.fp_bee_dft & 0xFFFFFFFFu));
+        h = auto_hash_mix(h, (int32_t) (cur_fp.fp_bee_dft >> 32));
+        h = auto_hash_mix(h, (int32_t) cur_fp.fp_cache_k);
+        h = auto_hash_mix(h, (int32_t) cur_fp.fp_cache_v);
+        return h;
+    }
+
+    // Auto-snapshot filename: the salt prefix lets the startup scan reject files belonging to a
+    // foreign model OR to a differently-configured peer by name before opening anything; chain-hash
+    // + token-count make it deterministic across processes (a same-prefix save from another process
+    // yields the same name -> atomic-rename-idempotent).
+    std::string auto_state_filename(uint64_t chain_hash, size_t n_tokens) const {
+        char buf[96]; // "auto-" + 16 hex salt + "-" + 16 hex hash + "-" + up to 20-digit count + ".bin" < 96
+        snprintf(buf, sizeof(buf), "auto-%016" PRIx64 "-%016" PRIx64 "-%zu.bin",
+                 auto_name_salt(), chain_hash, n_tokens);
+        return params_base.slot_save_path + std::string(buf);
+    }
+
+    // Insert/keep-longer: an entry replaces an existing boundary only if it covers a longer prefix.
+    void auto_index_insert_locked(uint64_t boundary, const auto_cache_entry & e) {
+        auto it = auto_idx.by_boundary.find(boundary);
+        if (it == auto_idx.by_boundary.end() || it->second.n_tokens < e.n_tokens) {
+            auto_idx.by_boundary[boundary] = e;
+        }
+    }
+
+    // Scan the slot-save dir and (re)build index entries from .meta sidecars: header-only reads
+    // (never the multi-GB state). Each bad/foreign file is skipped individually (invariant 4).
+    // Idempotent, so it is safe to call repeatedly for the cross-process refresh.
+    // CALLER MUST HOLD auto_idx.mtx.
+    void auto_index_scan_locked() {
+        std::error_code mec;
+        const auto dmt = std::filesystem::last_write_time(params_base.slot_save_path, mec);
+        if (!mec) {
+            auto_idx.dir_mtime = dmt; // snapshot the dir mtime we are scanning at
+        }
+        std::error_code ec;
+        for (std::filesystem::directory_iterator it(params_base.slot_save_path, ec), end;
+             !ec && it != end; it.increment(ec)) {
+            std::error_code fec;
+            if (!it->is_regular_file(fec) || fec) {
+                continue;
+            }
+            const std::string p = it->path().string();
+            // only our own state files: basename "auto-*.bin" (sidecars and temps skipped).
+            const std::string base = it->path().filename().string();
+            if (base.rfind("auto-", 0) != 0) {
+                continue; // not one of ours
+            }
+            if (p.size() < 4 || p.compare(p.size() - 4, 4, ".bin") != 0) {
+                continue;
+            }
+            // already indexed by a prior scan? cheap skip so a refresh only opens NEW files.
+            if (auto_idx.indexed_files.count(p)) {
+                continue;
+            }
+            model_fp fp;
+            llama_tokens toks;
+            if (!slot_meta_read(p, fp, toks)) {
+                continue; // no/short/corrupt meta -> not indexable (invariant 4)
+            }
+            if (!(fp == cur_fp)) {
+                continue; // foreign model / requant / different KV geometry (invariant 3)
+            }
+            const auto bhs = auto_block_hashes(toks, params_base.slot_save_block, auto_name_salt());
+            auto_cache_entry e{ p, (uint32_t) toks.size(), fp };
+            for (uint64_t bh : bhs) {
+                auto_index_insert_locked(bh, e);
+            }
+            auto_idx.indexed_files.insert(p);
+        }
+    }
+
+    // One-time startup scan: builds the initial index. Invariant 1: only ever called from an
+    // auto_cache_enabled() branch.
+    void auto_index_scan() {
+        std::lock_guard<std::mutex> lk(auto_idx.mtx);
+        if (auto_idx.scanned) {
+            return;
+        }
+        auto_idx.scanned = true;
+        auto_idx.last_refresh = std::chrono::steady_clock::now();
+        auto_index_scan_locked();
+    }
+
+    // After an LRU eviction (ours OR a peer process's), drop index boundaries pointing at files
+    // that no longer exist, and forget them in indexed_files so a future re-create can be
+    // re-indexed. CALLER MUST HOLD auto_idx.mtx.
+    void auto_index_drop_missing_locked() {
+        std::unordered_set<std::string> gone;
+        for (auto it = auto_idx.by_boundary.begin(); it != auto_idx.by_boundary.end(); ) {
+            std::error_code ec;
+            if (!std::filesystem::exists(it->second.state_path, ec) || ec) {
+                gone.insert(it->second.state_path);
+                it = auto_idx.by_boundary.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        for (const auto & p : gone) {
+            auto_idx.indexed_files.erase(p);
+        }
+    }
+
+    // Cross-process refresh: make snapshots that OTHER processes created visible here WITHOUT a
+    // restart. Throttled to at most once per AUTO_REFRESH_MIN_MS, and even then it only stats the
+    // dir mtime - a full re-scan happens ONLY when the dir actually changed or `force` is set (a
+    // lookup miss, where we are about to pay a cold prefill anyway).
+    // CALLER MUST HOLD auto_idx.mtx.
+    void auto_index_refresh_locked(bool force) {
+        const auto now = std::chrono::steady_clock::now();
+        if (!force &&
+            now - auto_idx.last_refresh < std::chrono::milliseconds(AUTO_REFRESH_MIN_MS)) {
+            return; // throttled: avoid a stat storm during a burst of lookups
+        }
+        auto_idx.last_refresh = now;
+        std::error_code ec;
+        const auto dmt = std::filesystem::last_write_time(params_base.slot_save_path, ec);
+        if (!ec && dmt == auto_idx.dir_mtime && !force) {
+            return; // nothing changed on disk since the last scan
+        }
+        // a peer changed the dir (or forced): re-scan for NEW files, then reconcile deletions.
+        auto_index_scan_locked();
+        auto_index_drop_missing_locked();
+    }
+
+    // Longest-prefix lookup over the request tokens. Returns the candidate whose boundary hash is
+    // the DEEPEST match with a fingerprint equal to the live one. Verification (byte-compare of the
+    // candidate's persisted tokens) is mandatory and done by the caller (invariant 2). O(#blocks).
+    std::optional<auto_cache_entry> auto_index_lookup(const llama_tokens & req) {
+        if (!auto_cache_enabled()) {
+            return std::nullopt; // off by default
+        }
+        const auto bhs = auto_block_hashes(req, params_base.slot_save_block, auto_name_salt());
+        std::lock_guard<std::mutex> lk(auto_idx.mtx);
+        auto_index_refresh_locked(/*force=*/false);
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            for (size_t k = bhs.size(); k-- > 0; ) { // longest boundary first
+                auto it = auto_idx.by_boundary.find(bhs[k]);
+                if (it == auto_idx.by_boundary.end()) {
+                    continue;
+                }
+                if (!(it->second.fp == cur_fp)) {
+                    continue; // invariant 3
+                }
+                return it->second;
+            }
+            if (attempt == 0) {
+                auto_index_refresh_locked(/*force=*/true); // miss -> rescan once before giving up
+            }
+        }
+        return std::nullopt;
+    }
+
+    // Restore a disk snapshot INTO `slot`. Shared by the manual SLOT_RESTORE handler and the
+    // transparent auto-restore path. Returns true on success (slot.prompt.tokens + just_restored +
+    // restored_logits are set). On ANY failure the slot's prompt tokens are cleared and false is
+    // returned so the caller falls through to a normal prefill (invariant 4).
+    //
+    // BeeLlama: the token payload of the state file is the server_tokens SERIALIZED form (see
+    // server_tokens::serialize/deserialize), not a bare token-id array - the manual endpoint has
+    // always written it that way, and the auto path writes the same shape so the two stores are
+    // mutually readable. The load is done in two passes (capacity query, then read) exactly as the
+    // manual handler does.
+    bool do_slot_restore(server_slot & slot, const std::string & filepath,
+                         size_t * out_token_count = nullptr, size_t * out_nread = nullptr,
+                         std::string * out_err = nullptr) {
+        size_t nread = 0;
+        size_t n_packed = 0;
+        try {
+            llama_tokens packed;
+            nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot.id, nullptr, 0, &n_packed);
+            if (nread != 0) {
+                packed.resize(std::max<size_t>(1, n_packed));
+                nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot.id, packed.data(), packed.size(), &n_packed);
+            }
+            if (nread == 0) {
+                throw std::runtime_error("No available space in KV cache or invalid slot save file");
+            }
+            packed.resize(n_packed);
+
+            server_tokens restored = server_tokens::deserialize(packed, mctx != nullptr);
+
+            if (restored.size() > (size_t) slot.n_ctx) {
+                throw std::runtime_error("Restored prompt does not fit in the slot context");
+            }
+
+            if (!restored.validate(ctx_tgt)) {
+                throw std::runtime_error("Invalid tokens in slot save file");
+            }
+
+            slot.prompt.clear();
+            slot.prompt.tokens = std::move(restored);
+        } catch (const std::exception & err) {
+            if (out_err) {
+                *out_err = err.what();
+            }
+            slot.prompt_clear(); // KV may already have been invalidated by the partial load
+            if (out_nread)       { *out_nread = 0; }
+            if (out_token_count) { *out_token_count = 0; }
+            return false;
+        }
+
+        const size_t token_count = slot.prompt.tokens.size();
+        if (out_nread)       { *out_nread = nread; }
+        if (out_token_count) { *out_token_count = token_count; }
+
+        slot.just_restored = true;
+
+        // Reconstruct a context checkpoint at the restored position so hybrid/recurrent (and SWA,
+        // and KVarN) models - which cannot freely rewind - can reuse this state for the suffix.
+        // create_checkpoint() dereferences slot.task, so this is only possible on the prefill path
+        // (auto-restore); the manual SLOT_RESTORE endpoint runs on an idle, task-less slot. The
+        // --ctx-checkpoints 0 guard matches the pre-existing create_checkpoint() call site.
+        //
+        // NOTE (KVarN/RS): create_checkpoint() additionally bails out when the restored token count
+        // is not a multiple of the KVarN descriptor group (prompt_reuse_boundary_is_stable), so a
+        // snapshot whose length is not group-aligned gets NO checkpoint here. Such a restore then
+        // relies entirely on the live seq-rm rollback plan for any suffix rewind; if that is
+        // refused, the request falls back to a normal prefill (never wrong output).
+        if (slot.task && params_base.n_ctx_checkpoints > 0 &&
+            ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART) {
+            const auto ckpt_pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
+            const auto ckpt_pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+            if (ckpt_pos_min >= 0) {
+                slot.prompt.checkpoints.clear();
+                create_checkpoint(slot, 0, ckpt_pos_min, ckpt_pos_max);
+            }
+        }
+
+        // The restored state's running distribution is unknown; invalidate any stale capture so a
+        // later SLOT_SAVE cannot persist a mismatched sidecar.
+        slot.logits_last.clear();
+        slot.logits_last_n_tokens = -1;
+
+        // Load the regenerate logits sidecar (FULL only) so an exact-prompt regenerate can emit the
+        // first token without re-decoding into the restored recurrent state.
+        slot.restored_logits.clear();
+        if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
+            const int nv = llama_vocab_n_tokens(llama_model_get_vocab(model_tgt));
+            if (slot_logits_read(filepath, nv, (uint32_t) token_count, slot.restored_logits)) {
+                SLT_INF(slot, "loaded logits sidecar (%d vocab, %zu tokens) - regenerate fast-path armed\n", nv, token_count);
+            }
+        }
+        return true;
+    }
+
+    // AUTO-RESTORE wrapper: byte-verify the candidate's persisted tokens against the request prefix
+    // (invariant 2), confirm the fingerprint (invariant 3), then restore. Returns the claimed reuse
+    // length used to decide whether the restore is worth it, or 0 if nothing was restored (caller
+    // keeps the in-memory prefill path). `req` is the full request token-ID array; `n_keep_mem` is
+    // the in-memory match to beat.
+    //
+    // NOTE: a successful restore always loads the WHOLE snapshot into the slot - the return value is
+    // a reuse-margin estimate, not a bound on what lands in the slot. The caller recomputes the
+    // actual reusable prefix from slot.prompt.tokens and trims the rest through the normal
+    // rollback path.
+    int auto_restore_into_slot(server_slot & slot, const auto_cache_entry & cand,
+                               const llama_tokens & req, int n_keep_mem) {
+        // read the small .meta sidecar (tokens + fp) - never opens the multi-GB state file.
+        model_fp disk_fp;
+        llama_tokens disk_toks;
+        if (!slot_meta_read(cand.state_path, disk_fp, disk_toks)) {
+            return 0; // invariant 4
+        }
+        if (!(disk_fp == cur_fp)) {
+            return 0; // invariant 3
+        }
+        // byte-verify: longest common prefix of the persisted tokens and the request (invariant 2).
+        const size_t lim = std::min(disk_toks.size(), req.size());
+        size_t v = 0;
+        while (v < lim && disk_toks[v] == req[v]) {
+            ++v;
+        }
+        const int B = params_base.slot_save_block;
+        int n_keep_disk;
+        if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART) {
+            // Attention (PART) memory supports per-token partial seq_rm, so a mid-snapshot
+            // divergence is fine. The block clamp here is purely a MARGIN HEURISTIC feeding the
+            // "must beat the in-memory match by a block" gate below: it rounds the verified prefix
+            // down to a whole block so a near-miss does not justify a multi-GB load. It does NOT
+            // limit the restore - do_slot_restore always loads the entire snapshot, and the caller
+            // (which ignores this return value) recomputes the real common prefix and rolls the
+            // remainder back per-token.
+            if (v == disk_toks.size()) {
+                n_keep_disk = (int) disk_toks.size();
+            } else {
+                n_keep_disk = (int) (v - (v % (size_t) B));
+            }
+        } else {
+            // BeeLlama: FULL (recurrent/hybrid) AND RS (KVarN, bounded group-aligned rollback)
+            // cannot be freely rewound to an arbitrary mid-snapshot position. do_slot_restore loads
+            // the ENTIRE L-token snapshot; a later keep_first(n_past < L) would demand a partial
+            // rollback that FULL refuses outright and that RS only honours within the last
+            // kvarn.group tokens. So we ONLY auto-restore when the request diverges at or beyond
+            // the snapshot end (v == disk_toks.size(), i.e. the whole snapshot is a verified prefix
+            // of the request). Otherwise refuse and fall back to a normal prefill.
+            if (v != disk_toks.size()) {
+                return 0;
+            }
+            n_keep_disk = (int) disk_toks.size();
+        }
+        if (n_keep_disk <= 0) {
+            return 0;
+        }
+        // MARGIN gate (invariant 5): only pay a multi-GB load if disk strictly beats the
+        // in-memory match by at least one block - never thrash a reload to save a few tokens.
+        if (n_keep_disk < n_keep_mem + B) {
+            return 0;
+        }
+        // Clear the slot's resident KV before loading the snapshot. slot.mem covers the target AND
+        // (when owned) the draft context; a draft-owning slot never reaches here (auto_slot_excluded).
+        slot.mem.seq_rm(slot.id, -1, -1);
+        slot.prompt.tokens.clear();
+        slot.prompt.checkpoints.clear();
+
+        if (!do_slot_restore(slot, cand.state_path)) {
+            // restore failed -> slot already cleared by do_slot_restore; caller reprefills (invariant 4).
+            return 0;
+        }
+        // Bump the snapshot's mtime so the LRU treats a reused-but-not-rewritten base snapshot as
+        // recently-used (true LRU, not least-recently-written). Best-effort (invariant 4).
+        auto_touch_unit(cand.state_path);
+        slot.prompt_cache_source = "disk";
+        slot.prompt_cache_reason = "auto_disk_restore_committed";
+        SLT_INF(slot, "auto-restore: reused %d tokens from disk (in-memory match was %d), file=%s\n",
+                n_keep_disk, n_keep_mem, cand.state_path.c_str());
+        return n_keep_disk;
+    }
+
+    // AUTO-SAVE: persist a slot's KV before it is discarded, keyed by its token-prefix block hash.
+    // Skips redundant writes (an equal-or-longer snapshot already covers this prefix), writes the
+    // state + .logits + .meta as a 3-file unit (atomically, .meta LAST so a torn write is never
+    // indexed), enforces the bounded LRU, then reconciles the index. Invariant 1: first statement
+    // is the gate; invariant 5: only called on slot release/reassign, never during generation.
+    void auto_save_slot_if_useful(server_slot & slot) {
+        if (!auto_cache_enabled()) {
+            return; // off by default
+        }
+        // BeeLlama gate (3): owned draft KV cannot be persisted alongside the target.
+        if (auto_slot_excluded(slot)) {
+            return;
+        }
+        // exclusions reuse the existing guards. NOTE: an idle slot has already been reset(), so
+        // `slot.task` is null here - the just-finished task survives as `slot.task_prev`. Gate on
+        // the PER-REQUEST has_media() (not the server-wide has_mtmd/mctx) so an --mmproj server
+        // still persists its text-only turns; a turn carrying an image is skipped, since token-ids
+        // alone cannot identify image content (5).
+        const auto & wtask = slot.task ? slot.task : slot.task_prev;
+        if (!wtask || !wtask->need_sampling() || slot.prompt.tokens.has_media()) {
+            return;
+        }
+        // The fingerprint captures the GLOBAL LoRA set; refuse to persist a snapshot taken under a
+        // per-request adapter override that differs from it (invariant 3).
+        if (!are_lora_equal(slot.lora, params_base.lora_adapters)) {
+            return;
+        }
+        // get_text_tokens() (not get_tokens()): media-safe accessor that never trips the
+        // get_tokens() assert under mmproj. For this no-media prompt it equals the full token-id
+        // prefix, so the block-hash key is byte-identical to what a text-only server would write.
+        const llama_tokens toks = slot.prompt.tokens.get_text_tokens();
+        if ((int) toks.size() < params_base.slot_save_block) {
+            return; // < 1 block: not worth a multi-GB write
+        }
+        const auto bhs = auto_block_hashes(toks, params_base.slot_save_block, auto_name_salt());
+        if (bhs.empty()) {
+            return;
+        }
+        const uint64_t full_hash = bhs.back(); // commits the whole whole-block prefix
+        {
+            std::lock_guard<std::mutex> lk(auto_idx.mtx);
+            auto it = auto_idx.by_boundary.find(full_hash);
+            if (it != auto_idx.by_boundary.end() && it->second.n_tokens >= toks.size()) {
+                return; // an equal-or-longer snapshot for this exact prefix already exists
+            }
+        }
+
+        const std::string fname = auto_state_filename(full_hash, toks.size());
+        // cross-process atomicity: the temp path MUST be unique per writer, because the final name
+        // is deterministic. pid + a per-process monotonic counter disambiguate it, so each writer
+        // owns its own complete temp and the deterministic-name rename is the ONLY shared step.
+        static std::atomic<uint64_t> s_tmp_nonce{0};
+        const uint64_t nonce = s_tmp_nonce.fetch_add(1, std::memory_order_relaxed);
+        const std::string tmp = fname + "." + std::to_string((long) getpid()) + "." +
+                                std::to_string(nonce) + ".tmp";
+
+        // BeeLlama: persist the server_tokens SERIALIZED payload, matching the manual SLOT_SAVE
+        // endpoint (and therefore readable by do_slot_restore / the manual SLOT_RESTORE endpoint).
+        std::vector<char> packed;
+        try {
+            packed = slot.prompt.tokens.serialize();
+        } catch (const std::exception & err) {
+            SLT_WRN(slot, "auto-save: cannot serialize slot tokens (%s); skipping\n", err.what());
+            return;
+        }
+        GGML_ASSERT(packed.size() % sizeof(llama_token) == 0);
+
+        // 1) write the state to a per-writer-unique temp path (atomic via rename below).
+        const size_t nwrite = llama_state_seq_save_file(
+                ctx_tgt, tmp.c_str(), slot.id,
+                reinterpret_cast<const llama_token *>(packed.data()), packed.size() / sizeof(llama_token));
+        if (nwrite == 0) {
+            std::error_code ec; std::filesystem::remove(tmp, ec);
+            return; // invariant 4: disk full / IO error / memory refused the snapshot
+        }
+        // 2) regenerate logits sidecar on the temp path (FULL only, and only when the captured
+        //    distribution provably belongs to this exact state - the same stamp check SLOT_SAVE uses).
+        if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL &&
+            slot.logits_last_n_tokens == (int32_t) toks.size() && !slot.logits_last.empty()) {
+            const int nv = llama_vocab_n_tokens(llama_model_get_vocab(model_tgt));
+            slot_logits_write(tmp, slot.logits_last, nv, (uint32_t) toks.size());
+        }
+        // 3) meta sidecar on the temp path (tokens + fingerprint). Written but renamed LAST.
+        if (!slot_meta_write(tmp, cur_fp, toks, full_hash)) {
+            std::error_code ec;
+            std::filesystem::remove(tmp, ec);
+            std::filesystem::remove(slot_logits_sidecar_path(tmp), ec);
+            std::filesystem::remove(slot_meta_sidecar_path(tmp), ec);
+            return; // invariant 4
+        }
+        // 4) atomic publish: rename state first, then sidecars to their final names. .meta is the
+        //    last to appear, so a scan (which keys on .meta) never sees a half-written unit.
+        std::error_code ec;
+        std::filesystem::rename(tmp, fname, ec);
+        if (ec) {
+            std::filesystem::remove(tmp, ec);
+            std::filesystem::remove(slot_logits_sidecar_path(tmp), ec);
+            std::filesystem::remove(slot_meta_sidecar_path(tmp), ec);
+            return; // invariant 4
+        }
+        std::filesystem::rename(slot_logits_sidecar_path(tmp), slot_logits_sidecar_path(fname), ec);
+        ec.clear();
+        std::filesystem::rename(slot_meta_sidecar_path(tmp), slot_meta_sidecar_path(fname), ec);
+        // the .meta is the scan key - a unit whose .meta never landed must NOT be published.
+        if (ec) {
+            std::error_code rec;
+            std::filesystem::remove(fname, rec);
+            std::filesystem::remove(slot_logits_sidecar_path(fname), rec);
+            std::filesystem::remove(slot_logits_sidecar_path(tmp), rec);
+            std::filesystem::remove(slot_meta_sidecar_path(tmp), rec);
+            return; // invariant 4
+        }
+
+        SLT_INF(slot, "auto-save: persisted %zu tokens to %s\n", toks.size(), fname.c_str());
+
+        // index insert (every boundary -> this snapshot), then bounded-LRU + reconcile.
+        {
+            std::lock_guard<std::mutex> lk(auto_idx.mtx);
+            auto_cache_entry e{ fname, (uint32_t) toks.size(), cur_fp };
+            for (uint64_t bh : bhs) {
+                auto_index_insert_locked(bh, e);
+            }
+            auto_idx.indexed_files.insert(fname); // remember our own write so a refresh won't re-open it
+        }
+        if (params_base.slot_save_max_count > 0 || params_base.slot_save_max_bytes > 0) {
+            bool oversized = false;
+            slot_save_enforce_limits(params_base.slot_save_path,
+                                     params_base.slot_save_max_count,
+                                     params_base.slot_save_max_bytes,
+                                     fname, oversized);
+        }
+        // Reconcile index with what the LRU kept AND adopt the post-write dir mtime as our scan
+        // baseline - both under ONE lock, so OUR OWN save+evict does not make the next lookup think
+        // a PEER changed the dir.
+        {
+            std::lock_guard<std::mutex> lk(auto_idx.mtx);
+            auto_index_drop_missing_locked();
+            std::error_code mec;
+            const auto dmt = std::filesystem::last_write_time(params_base.slot_save_path, mec);
+            if (!mec) {
+                auto_idx.dir_mtime = dmt;
+            }
+        }
     }
 
     bool restore_checkpoint_transaction(
@@ -2844,6 +4262,17 @@ private:
                         for (auto & slot : slots) {
                             if (!slot.is_processing()) {
                                 SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
+
+                                // Auto-save (write path, invariant 5): persist this slot's KV to
+                                // disk BEFORE the in-memory cache drops it. This is the primary
+                                // (cache_idle_slots = true) auto-save site; it runs at task-launch
+                                // time for idle slots, i.e. off the launching task's generation hot
+                                // path, and reuses the same machinery the manual SLOT_SAVE endpoint
+                                // does. Gate the CALL SITE so the whole frame is elided when OFF;
+                                // the callee keeps its own first-statement gate.
+                                if (auto_cache_enabled() && slot.prompt.tokens.size() > 0) {
+                                    auto_save_slot_if_useful(slot);
+                                }
 
                                 const bool saved = slot.prompt_save(*prompt_cache);
                                 if (saved) {
@@ -2993,6 +4422,55 @@ private:
                         break;
                     }
 
+                    const size_t token_count = slot->prompt.tokens.size();
+
+                    // persist this slot's last-token logits as a sidecar (FULL/recurrent only).
+                    // Best-effort - a missing/failed sidecar simply disables the regenerate
+                    // fast-path for this snapshot. NOT folded into res->n_bytes (that contract
+                    // stays "state-file bytes only").
+                    //
+                    // CRITICAL consistency guard: only write the sidecar when the captured logits
+                    // provably belong to the EXACT state being saved, i.e. logits_last_n_tokens ==
+                    // token_count. This blocks every stale-logits path (restore-then-save with no
+                    // intervening decode; a spec-decode step that skipped the capture; a
+                    // distribution left over from a prior task on this slot object) from persisting
+                    // a sidecar that does not match the saved state.
+                    if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
+                        if (slot->logits_last_n_tokens == (int32_t) token_count && !slot->logits_last.empty()) {
+                            const int nv = llama_vocab_n_tokens(llama_model_get_vocab(model_tgt));
+                            const size_t nwrite_logits =
+                                slot_logits_write(filepath, slot->logits_last, nv, (uint32_t) token_count);
+                            if (nwrite_logits == 0) {
+                                SLT_WRN(*slot, "%s", "failed to write logits sidecar; regenerate fast-path disabled for this snapshot\n");
+                            }
+                        } else {
+                            SLT_DBG(*slot, "no matching captured logits for this state (stamp = %d, token_count = %zu); sidecar omitted\n",
+                                    slot->logits_last_n_tokens, token_count);
+                        }
+                    }
+
+                    // enforce the bounded slot-save store (LRU by mtime). If this single snapshot
+                    // exceeds the byte cap, reject the save instead of evicting everything.
+                    //
+                    // ONLY when the automatic disk cache is on: the caps describe the server-owned
+                    // auto store. A server that just uses the manual /slots save API with
+                    // --slot-save-path owns its own file naming and lifetime, so a manual save must
+                    // never delete anything in that directory.
+                    if (auto_cache_enabled() &&
+                        (params_base.slot_save_max_count > 0 || params_base.slot_save_max_bytes > 0)) {
+                        bool oversized = false;
+                        slot_save_enforce_limits(params_base.slot_save_path,
+                                                 params_base.slot_save_max_count,
+                                                 params_base.slot_save_max_bytes,
+                                                 filepath, oversized);
+                        if (oversized) {
+                            send_error(task,
+                                       "slot snapshot exceeds --slot-save-max-mb; save rejected",
+                                       ERROR_TYPE_INVALID_REQUEST);
+                            break;
+                        }
+                    }
+
                     const int64_t t_end = ggml_time_us();
                     const double t_save_ms = (t_end - t_start) / 1000.0;
 
@@ -3026,35 +4504,14 @@ private:
                     std::string filename = task.slot_action.filename;
                     std::string filepath = task.slot_action.filepath;
 
+                    // Shared restore body (also used by the transparent auto-restore path): loads
+                    // the state file into seq slot->id, sets just_restored + restored_logits, and
+                    // rebuilds a context checkpoint when the slot is mid-task. On a load failure
+                    // the slot is cleared and we error out.
                     size_t nread = 0;
-                    try {
-                        size_t n_packed = 0;
-                        llama_tokens packed;
-                        nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, nullptr, 0, &n_packed);
-                        if (nread != 0) {
-                            packed.resize(std::max<size_t>(1, n_packed));
-                            nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, packed.data(), packed.size(), &n_packed);
-                        }
-                        if (nread == 0) {
-                            throw std::runtime_error("No available space in KV cache or invalid slot save file");
-                        }
-                        packed.resize(n_packed);
-
-                        server_tokens restored = server_tokens::deserialize(packed, mctx != nullptr);
-
-                        if (restored.size() > (size_t) slot->n_ctx) {
-                            throw std::runtime_error("Restored prompt does not fit in the slot context");
-                        }
-
-                        if (!restored.validate(ctx_tgt)) {
-                            throw std::runtime_error("Invalid tokens in slot save file");
-                        }
-
-                        slot->prompt.clear();
-                        slot->prompt.tokens = std::move(restored);
-                    } catch (const std::exception & err) {
-                        slot->prompt_clear();
-                        send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
+                    std::string restore_err;
+                    if (!do_slot_restore(*slot, filepath, /*out_token_count =*/ nullptr, &nread, &restore_err)) {
+                        send_error(task, std::string("Unable to restore slot: ") + restore_err, ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
 
@@ -3716,11 +5173,49 @@ private:
                             if (slot.task->params.cache_prompt) {
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
+
+                                // ===== AUTO-RESTORE: cold/cross-process KV reuse from disk (opt-in) ==========
+                                // If the in-memory match (n_past) is POOR and the disk index holds a snapshot
+                                // whose persisted tokens are a verified, fingerprint-matching, longer prefix of
+                                // this request, restore it INTO the slot and RECOMPUTE n_past so all downstream
+                                // machinery runs unchanged - agnostic to HOW the tokens arrived. Gated on the
+                                // PER-REQUEST has_media() (not the server-wide has_mtmd) so an --mmproj server
+                                // still caches its text-only turns. auto_restore_into_slot byte-verifies tokens
+                                // + fingerprint and falls back to a normal prefill on any mismatch/failure
+                                // (invariants 2/3/4). BeeLlama: slots with an owned draft KV cache are excluded
+                                // outright (auto_slot_excluded).
+                                if (auto_cache_enabled()
+                                        && !auto_slot_excluded(slot)
+                                        && slot.task->need_sampling()        // generative only (not embed/rerank)
+                                        && !slot.prompt.tokens.has_media()   // no media in THIS request
+                                        && !input_tokens.has_media()
+                                        && slot.alora_invocation_start <= 0  // aLoRA caching bound (mirror below)
+                                        && are_lora_equal(slot.lora, params_base.lora_adapters)) {
+                                    const llama_tokens req = input_tokens.get_text_tokens();
+                                    if (auto cand = auto_index_lookup(req)) {
+                                        // auto_restore_into_slot may CLEAR the slot (KV seq +
+                                        // prompt.tokens) and then have do_slot_restore FAIL (corrupt
+                                        // .bin, KV-capacity exceeded, racing LRU eviction). In that case
+                                        // the slot tokens are now empty. We therefore RECOMPUTE n_past
+                                        // UNCONDITIONALLY after any attempt - not only on success - so a
+                                        // cleared-but-failed restore falls back to n_past = 0 (clean cold
+                                        // prefill) instead of carrying a stale n_keep_mem > 0 into
+                                        // keep_first() on an empty token vector. The recompute is harmless
+                                        // on the early-return-before-clear paths (margin/fp/verify
+                                        // rejects): those leave prompt.tokens untouched.
+                                        auto_restore_into_slot(slot, *cand, req, (int) n_past);
+                                        n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
+                                    }
+                                }
+                                // ===== end AUTO-RESTORE =====================================================
+
                                 slot.n_prompt_tokens_lcp = n_past;
                                 if (n_past > 0 && slot.prompt_cache_source == "none") {
                                     slot.prompt_cache_source = "live";
                                 }
-                                slot.prompt_cache_reason = n_past > 0 ? "candidate" : "no_common_prefix";
+                                if (slot.prompt_cache_source != "disk") {
+                                    slot.prompt_cache_reason = n_past > 0 ? "candidate" : "no_common_prefix";
+                                }
 
                                 // if there is an alora invoked, don't cache after the invocation start
                                 if (slot.alora_invocation_start > 0) {
@@ -3803,6 +5298,127 @@ private:
                             // the largest pos_min required for a checkpoint to be useful
                             const auto pos_min_thold = std::max(0, pos_next - n_swa - (has_new_tokens ? 0 : 1));
 
+                            // ===== restore-continue (regenerate fast-path) ==============================
+                            // A just-restored FULL/recurrent slot receiving the EXACT restored tokens (no
+                            // suffix) cannot rewind its memory: the normal path would re-decode into the
+                            // already-occupied sequence and crash. Detect that case here, BEFORE the
+                            // n_past > 0 guard, and:
+                            //   - if we have the saved next-token logits: emit the first token with NO
+                            //     decode, keeping the full restored state, then continue normal
+                            //     autoregression;
+                            //   - otherwise: fall back to a SAFE clear-then-reprefill (never crash).
+                            // Gated so it is unreachable for non-FULL memory (a KVarN/RS or standard/PART
+                            // context reaches the ordinary live-rollback-plan path below, which handles the
+                            // one-token regenerate rollback natively), for with-suffix requests, for
+                            // non-generative slots, and for multimodal (excluded at save/restore).
+                            // NOTE: cache_prompt == false sets n_past = 0 above, so this gate is naturally
+                            // not entered for a no-cache request.
+                            if (slot.just_restored &&
+                                ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL &&
+                                slot.task->need_sampling() &&
+                                slot.alora_invocation_start <= 0 &&
+                                n_past == slot.task->n_tokens() &&
+                                n_past == (int) slot.prompt.n_tokens()) {
+
+                                slot.just_restored = false; // one-shot consume (this path owns it)
+
+                                if (!slot.restored_logits.empty()) {
+                                    // --- fast path: emit first token from saved logits, no decode ---
+                                    slot.n_prompt_tokens_cache = n_past; // entire prompt "reused"
+                                    slot.stats.n_prompt_cached = (uint64_t) n_past;
+                                    slot.prompt_cache_source   = "disk";
+                                    slot.prompt_cache_reason   = "restore_continue";
+
+                                    // prime the sampler over the full restored prompt (penalties/grammar
+                                    // history), exactly as the normal DONE_PROMPT transition would.
+                                    slot.stats.n_gen = 0;
+                                    slot.init_sampler();
+
+                                    slot.state   = SLOT_STATE_GENERATING;
+                                    slot.i_batch = -1;
+
+                                    // rebuild the (cold, unsaved) draft context for the restored prompt,
+                                    // mirroring the normal prompt-done transition.
+                                    if (slot.can_speculate()) {
+                                        common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
+                                    }
+
+                                    const int nv = llama_vocab_n_tokens(llama_model_get_vocab(model_tgt));
+                                    const llama_token id = common_sampler_sample_from_logits(
+                                            slot.smpl.get(), slot.restored_logits.data(), nv, /*grammar_first=*/false);
+                                    slot.restored_logits.clear(); // consumed
+
+                                    // (4) MUST go through accept-with-info: common_sampler_sample_from_logits
+                                    // bypasses the accept path, and the reasoning budget + the reasoning-loop
+                                    // guard both advance only from common_sampler_accept_with_info().
+                                    const auto accept_info = common_sampler_accept_with_info(slot.smpl.get(), id, true);
+                                    (void) handle_loop_guard_accept(slot, accept_info);
+
+                                    // mirror the generation accounting from the normal sample path
+                                    const int64_t t_now = ggml_time_us();
+                                    slot.stats.n_gen += 1;
+                                    slot.stats.update_prompt_last();
+                                    slot.t_print_last = t_now;
+                                    slot.n_gen_last   = 0;
+                                    slot.stats.update_gen_last();
+                                    metrics.n_prompt_cached += (uint64_t) n_past;
+
+                                    if (slot.task->params.stream) {
+                                        // mirror the normal prompt-start streaming signal exactly so a
+                                        // return_progress client still gets its initial 0% progress event
+                                        if (slot.task->params.return_progress) {
+                                            send_partial_response(slot, {}, true);
+                                        } else {
+                                            // signal HTTP to send the headers (200 status)
+                                            send_partial_response(slot, {}, false, true);
+                                        }
+                                    }
+
+                                    completion_token_output result;
+                                    result.tok = id;
+                                    // inline of the accept_special_token lambda (defined later in this
+                                    // method, out of scope here): keep special tokens iff the server allows
+                                    // specials or the request explicitly preserves this token.
+                                    const bool keep_special =
+                                        params_base.special ||
+                                        slot.task->params.sampling.preserved_tokens.find(result.tok) !=
+                                            slot.task->params.sampling.preserved_tokens.end();
+                                    result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, keep_special);
+                                    result.prob         = 1.0f;
+
+                                    // First-token logprobs (n_probs > 0): the post-sampling variant reads
+                                    // the candidate set (cur_p), which common_sampler_sample_from_logits
+                                    // leaves populated. The pre-sampling variant reads raw ctx logits at a
+                                    // decode index we bypass here, so restrict the call to post_sampling.
+                                    if (slot.task->params.sampling.n_probs > 0 && slot.task->params.post_sampling_probs) {
+                                        populate_token_probs(slot, result, /*post_sampling=*/true, params_base.special, /*idx=*/-1);
+                                    }
+
+                                    if (!process_token(result, slot)) {
+                                        slot.print_timings();
+                                        send_final_response(slot);
+                                        slot.release();
+                                    }
+
+                                    SLT_INF(slot, "%s", "restore-continue: emitted first token from saved logits (prompt_n = 0)\n");
+                                    return; // skip ALL prompt-batch building for this slot this iteration
+                                }
+
+                                // --- safe fallback: no valid sidecar -> clear restored seq, then reprefill ---
+                                // FULL models support full-sequence removal; clearing first guarantees the
+                                // subsequent reprefill writes into an EMPTY sequence instead of re-decoding
+                                // into the already-occupied restored state.
+                                SLT_WRN(slot, "%s", "restore-continue: no saved logits; clearing restored state and re-prefilling\n");
+                                slot.mem.seq_rm(slot.id, -1, -1);
+                                slot.prompt.tokens.clear();
+                                slot.prompt.checkpoints.clear();
+                                n_past   = 0;
+                                pos_next = 0; // keep the stale full-length value out of the checkpoint-erase loop
+                                slot.prompt_cache_source = "none";
+                                slot.prompt_cache_reason = "restore_continue_no_logits";
+                            }
+                            // ===== end restore-continue =================================================
+
                             if (n_past > 0 && n_past <= slot.prompt.n_tokens()) {
                                 const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
                                 if (pos_min == -1) {
@@ -3884,6 +5500,16 @@ private:
                                         common_p0 > 0 && common_p0 <= pos_next;
                                 const bool extends_complete_prompt = n_past == slot.prompt.n_tokens();
                                 const bool state_required = !extends_complete_prompt && !use_live_plan;
+                                // KV restore-reuse: a slot whose state came from disk has no live
+                                // history behind pos_min, so a tail checkpoint sitting exactly AT
+                                // pos_min_thold is still usable when genuinely-new tokens follow it -
+                                // those supply the required logits, so the >= 1-token guarantee of
+                                // [TAG_PROMPT_LOGITS] still holds. Consumed here (one-shot) whether or
+                                // not the live plan below ends up being used.
+                                const bool slot_was_restored = slot.just_restored;
+                                slot.just_restored = false;
+                                const bool has_new_suffix = (size_t) slot.task->n_tokens() > (size_t) n_past;
+
                                 if (server_prompt_reuse_requires_checkpoint_search(
                                             state_required, pos_min, pos_min_thold)) {
                                     // Prefer the memory implementation's native suffix plan before
@@ -3914,7 +5540,8 @@ private:
                                                     return false;
                                                 }
                                                 return prompt_reuse_boundary_is_stable(cur.n_tokens) &&
-                                                        (cur.pos_min < pos_min_thold || cur.pos_min == 0);
+                                                        (cur.pos_min == 0 || cur.pos_min < pos_min_thold ||
+                                                         (slot_was_restored && has_new_suffix && cur.pos_min == pos_min_thold));
                                             }
                                         );
 
@@ -4495,6 +6122,14 @@ private:
                 id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
             }
 
+            // capture this slot's last-token full-vocab logits for a possible disk save. Cost: one
+            // ~n_vocab*4-byte copy per decoded token, incurred ONLY on FULL/recurrent models AND
+            // only when slot saving is enabled (--slot-save-path set). The copy is unavoidable for
+            // correctness: ctx logits are overwritten by the next slot's decode, so a lazy read at
+            // SLOT_SAVE time would be wrong under --parallel > 1. common_sampler_sample already
+            // synchronized the context above, so llama_get_logits_ith is valid here.
+            slot_capture_logits(slot, tok_idx);
+
             slot.i_batch = -1;
 
             const auto accept_info = common_sampler_accept_with_info(slot.smpl.get(), id, true);
@@ -4580,9 +6215,20 @@ private:
                     : server_sample_and_accept_synth(
                             slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
                             synth_probs, slot.spec_synth_rng, slot.spec_is_replay, on_accept);
-                slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
+
+                // KV restore-reuse (4): under speculative decoding the "last decoded token's
+                // logits" must be the distribution that produced the last ACCEPTED token, i.e. the
+                // batch index the sampler actually used for accepted.back(). Record it now, before
+                // spec_i_batch is cleared; the capture itself happens after prompt.tokens has been
+                // rewritten to the accepted prefix, so the stamp matches the saved state. Invalidate
+                // first, so any early return below (a checkpoint rollback) leaves no stale capture.
+                slot.logits_last.clear();
+                slot.logits_last_n_tokens = -1;
+                slot.spec_logits_idx = slot.spec_i_batch[accepted.size() - 1];
+
+                slot.spec_i_batch.clear();
 
                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
 
@@ -4598,7 +6244,12 @@ private:
                             SLT_INF(slot, "accepted %2zu/%2zu draft tokens (restore checkpoint)\n", accepted.size() - 1, slot.spec_draft.size());
                         }
 
-                        // partial acceptance is not supported by the context -> truncate the draft and restore the state
+                        // partial acceptance is not supported by the context -> truncate the draft and restore the state.
+                        // the accepted prefix is not committed here: it is replayed and re-verified next round, whose
+                        // accept() would carry the stale draft count of this round. report the partial acceptance now
+                        // via accept_partial - only the adaptive MTP controller consumes it
+                        common_speculative_accept_partial(spec.get(), slot.id, accepted.size() - 1);
+
                         slot.spec_is_replay = true;
                         slot.spec_draft = std::move(accepted);
 
@@ -4688,6 +6339,12 @@ private:
 
             slot.sampled = ids.back(); // last accepted token
             SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
+
+            // KV restore-reuse (4): prompt.tokens now ends at ids[ids.size()-2] and ids.back() is
+            // the sampled-but-not-yet-appended token - exactly the invariant the ordinary sampling
+            // path has at its capture point. Stamp with the current token count.
+            slot_capture_logits(slot, slot.spec_logits_idx, (int32_t) slot.prompt.tokens.size());
+            slot.spec_logits_idx = -1;
 
             slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
 

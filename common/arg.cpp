@@ -517,9 +517,7 @@ common_models_handler common_models_handler_init(const common_params & params, l
     common_download_hf_plan plan_spec;
     common_download_opts opts;
 
-    const bool spec_type_draft_mtp = std::find(params.speculative.types.begin(),
-                                        params.speculative.types.end(),
-                                        COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    const bool spec_type_draft_mtp = params.speculative.has_mtp();
 
     const bool spec_type_draft_dflash = std::find(params.speculative.types.begin(),
                                            params.speculative.types.end(),
@@ -1119,7 +1117,35 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         params.default_template_kwargs["preserve_reasoning"] = "true";
     }
 
+    // the auto disk prompt/KV cache needs a directory to live in; fail fast & loud rather than
+    // silently doing nothing if --slot-save-auto is set without --slot-save-path.
+    if (params.slot_save_auto && params.slot_save_path.empty()) {
+        throw std::invalid_argument("--slot-save-auto requires --slot-save-path to be set");
+    }
+    if (params.slot_save_auto && params.slot_save_block <= 0) {
+        throw std::invalid_argument("--slot-save-block must be > 0");
+    }
     return true;
+}
+
+// BeeLlama: KVarN reuses prompt prefixes only at descriptor-group boundaries
+// (kvarn.group, 128 by default). A block size that is not a multiple of the group
+// would hand the server prefix lengths it can never roll back to, so reject it here
+// instead of silently producing unusable snapshots.
+//
+// MUST be called after common_params_kvarn_normalize(): params.kvarn is derived from
+// --cache-type-k/-v there, so it is still DISABLED while common_params_parse_ex() runs.
+static void common_validate_slot_save_auto(const common_params & params) {
+    if (!params.slot_save_auto || params.kvarn.type == LLAMA_KVARN_TYPE_DISABLED) {
+        return;
+    }
+
+    const int32_t group = params.kvarn.group > 0 ? params.kvarn.group : 128;
+    if (params.slot_save_block % group != 0) {
+        throw std::invalid_argument(string_format(
+            "--slot-save-block (%d) must be a multiple of the KVarN group size (%d)",
+            params.slot_save_block, group));
+    }
 }
 
 static void common_params_print_usage(common_params_context & ctx_arg) {
@@ -1578,6 +1604,7 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
         common_params_kvarn_normalize(ctx_arg.params);
         common_params_draft_kvarn_normalize(ctx_arg.params);
         common_validate_draft_kvarn_mode(ctx_arg.params.speculative);
+        common_validate_slot_save_auto(ctx_arg.params);
         ctx_arg.params.lr.init();
         common_validate_reasoning_loop_guard_params(ctx_arg.params.reasoning_loop_guard);
         ctx_arg.params.sampling.reasoning_budget_tracking =
@@ -2317,6 +2344,169 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, const std::string & value) {
             params.sampling.min_p = std::stof(value);
             params.sampling.user_sampling_config |= common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_MIN_P;
+        }
+    ).set_sampling());
+    add_opt(common_arg(
+        {"--reasoning-temp"}, "N",
+        "temperature override while inside the reasoning block; uses the existing sampling chain with continuous RNG and history state (default: inherit)",
+        [](common_params & params, const std::string & value) {
+            params.sampling.reasoning_temp = std::max(std::stof(value), 0.0f);
+            params.sampling.reasoning_sampling |= COMMON_PARAMS_SAMPLING_CONFIG_TEMP;
+        }
+    ).set_sampling());
+    add_opt(common_arg(
+        {"--reasoning-top-k"}, "N",
+        "top-k override while inside the reasoning block (default: inherit)",
+        [](common_params & params, int value) {
+            params.sampling.reasoning_top_k = value;
+            params.sampling.reasoning_sampling |= COMMON_PARAMS_SAMPLING_CONFIG_TOP_K;
+        }
+    ).set_sampling());
+    add_opt(common_arg(
+        {"--reasoning-top-p"}, "N",
+        "top-p override while inside the reasoning block (default: inherit)",
+        [](common_params & params, const std::string & value) {
+            params.sampling.reasoning_top_p = std::stof(value);
+            params.sampling.reasoning_sampling |= COMMON_PARAMS_SAMPLING_CONFIG_TOP_P;
+        }
+    ).set_sampling());
+    add_opt(common_arg(
+        {"--reasoning-min-p"}, "N",
+        "min-p override while inside the reasoning block (default: inherit)",
+        [](common_params & params, const std::string & value) {
+            params.sampling.reasoning_min_p = std::stof(value);
+            params.sampling.reasoning_sampling |= COMMON_PARAMS_SAMPLING_CONFIG_MIN_P;
+        }
+    ).set_sampling());
+    add_opt(common_arg(
+        {"--reasoning-top-n-sigma"}, "N",
+        "top-n-sigma override while inside the reasoning block (default: inherit)",
+        [](common_params & params, const std::string & value) {
+            params.sampling.reasoning_top_n_sigma = std::stof(value);
+            params.sampling.reasoning_sampling |= COMMON_PARAMS_SAMPLING_CONFIG_TOP_N_SIGMA;
+        }
+    ).set_sampling());
+    add_opt(common_arg(
+        {"--reasoning-xtc-probability"}, "N",
+        "XTC probability override while inside the reasoning block (default: inherit)",
+        [](common_params & params, const std::string & value) {
+            params.sampling.reasoning_xtc_probability = std::stof(value);
+            params.sampling.reasoning_sampling |= COMMON_PARAMS_SAMPLING_CONFIG_XTC_PROBABILITY;
+        }
+    ).set_sampling());
+    add_opt(common_arg(
+        {"--reasoning-xtc-threshold"}, "N",
+        "XTC threshold override while inside the reasoning block (default: inherit)",
+        [](common_params & params, const std::string & value) {
+            params.sampling.reasoning_xtc_threshold = std::stof(value);
+            params.sampling.reasoning_sampling |= COMMON_PARAMS_SAMPLING_CONFIG_XTC_THRESHOLD;
+        }
+    ).set_sampling());
+    add_opt(common_arg(
+        {"--reasoning-typical-p"}, "N",
+        "locally typical sampling override while inside the reasoning block (default: inherit)",
+        [](common_params & params, const std::string & value) {
+            params.sampling.reasoning_typ_p = std::stof(value);
+            params.sampling.reasoning_sampling |= COMMON_PARAMS_SAMPLING_CONFIG_TYPICAL_P;
+        }
+    ).set_sampling());
+    add_opt(common_arg(
+        {"--reasoning-dynatemp-range"}, "N",
+        "dynamic temperature range override while inside the reasoning block (default: inherit)",
+        [](common_params & params, const std::string & value) {
+            params.sampling.reasoning_dynatemp_range = std::stof(value);
+            params.sampling.reasoning_sampling |= COMMON_PARAMS_SAMPLING_CONFIG_DYNATEMP_RANGE;
+        }
+    ).set_sampling());
+    add_opt(common_arg(
+        {"--reasoning-dynatemp-exp", "--reasoning-dynatemp-exponent"}, "N",
+        "dynamic temperature exponent override while inside the reasoning block (default: inherit)",
+        [](common_params & params, const std::string & value) {
+            params.sampling.reasoning_dynatemp_exponent = std::stof(value);
+            params.sampling.reasoning_sampling |= COMMON_PARAMS_SAMPLING_CONFIG_DYNATEMP_EXPONENT;
+        }
+    ).set_sampling());
+    add_opt(common_arg(
+        {"--reasoning-repeat-last-n"}, "N",
+        "repeat history override while inside the reasoning block (default: inherit)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::runtime_error(string_format("error: invalid reasoning-repeat-last-n = %d\n", value));
+            }
+            params.sampling.reasoning_penalty_last_n = value;
+            params.sampling.n_prev = std::max(params.sampling.n_prev, value);
+            params.sampling.reasoning_sampling |= COMMON_PARAMS_SAMPLING_CONFIG_PENALTY_LAST_N;
+        }
+    ).set_sampling());
+    add_opt(common_arg(
+        {"--reasoning-repeat-penalty"}, "N",
+        "repeat-penalty override while inside the reasoning block (default: inherit)",
+        [](common_params & params, const std::string & value) {
+            params.sampling.reasoning_penalty_repeat = std::stof(value);
+            params.sampling.reasoning_sampling |= COMMON_PARAMS_SAMPLING_CONFIG_PENALTY_REPEAT;
+        }
+    ).set_sampling());
+    add_opt(common_arg(
+        {"--reasoning-presence-penalty"}, "N",
+        "presence penalty override while inside the reasoning block (default: inherit)",
+        [](common_params & params, const std::string & value) {
+            params.sampling.reasoning_penalty_present = std::stof(value);
+            params.sampling.reasoning_sampling |= COMMON_PARAMS_SAMPLING_CONFIG_PENALTY_PRESENT;
+        }
+    ).set_sampling());
+    add_opt(common_arg(
+        {"--reasoning-frequency-penalty"}, "N",
+        "frequency penalty override while inside the reasoning block (default: inherit)",
+        [](common_params & params, const std::string & value) {
+            params.sampling.reasoning_penalty_freq = std::stof(value);
+            params.sampling.reasoning_sampling |= COMMON_PARAMS_SAMPLING_CONFIG_PENALTY_FREQ;
+        }
+    ).set_sampling());
+    add_opt(common_arg(
+        {"--reasoning-dry-multiplier"}, "N",
+        "DRY multiplier override while inside the reasoning block (default: inherit)",
+        [](common_params & params, const std::string & value) {
+            params.sampling.reasoning_dry_multiplier = std::stof(value);
+            params.sampling.reasoning_sampling |= COMMON_PARAMS_SAMPLING_CONFIG_DRY_MULTIPLIER;
+        }
+    ).set_sampling());
+    add_opt(common_arg(
+        {"--reasoning-dry-base"}, "N",
+        "DRY base override while inside the reasoning block (default: inherit)",
+        [](common_params & params, const std::string & value) {
+            const float base = std::stof(value);
+            if (base < 1.0f) {
+                return;
+            }
+            params.sampling.reasoning_dry_base = base;
+            params.sampling.reasoning_sampling |= COMMON_PARAMS_SAMPLING_CONFIG_DRY_BASE;
+        }
+    ).set_sampling());
+    add_opt(common_arg(
+        {"--reasoning-dry-allowed-length"}, "N",
+        "DRY allowed length override while inside the reasoning block (default: inherit)",
+        [](common_params & params, int value) {
+            params.sampling.reasoning_dry_allowed_length = value;
+            params.sampling.reasoning_sampling |= COMMON_PARAMS_SAMPLING_CONFIG_DRY_ALLOWED_LEN;
+        }
+    ).set_sampling());
+    add_opt(common_arg(
+        {"--reasoning-dry-penalty-last-n"}, "N",
+        "DRY history override while inside the reasoning block (default: inherit)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::runtime_error(string_format("error: invalid reasoning-dry-penalty-last-n = %d\n", value));
+            }
+            params.sampling.reasoning_dry_penalty_last_n = value;
+            params.sampling.reasoning_sampling |= COMMON_PARAMS_SAMPLING_CONFIG_DRY_PENALTY_LAST_N;
+        }
+    ).set_sampling());
+    add_opt(common_arg(
+        {"--reasoning-min-keep"}, "N",
+        "minimum candidate count override while inside the reasoning block (default: inherit)",
+        [](common_params & params, int value) {
+            params.sampling.reasoning_min_keep = value;
+            params.sampling.reasoning_sampling |= COMMON_PARAMS_SAMPLING_CONFIG_MIN_KEEP;
         }
     ).set_sampling());
     add_opt(common_arg(
@@ -3968,6 +4158,42 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--slot-save-max-count"}, "N",
+        string_format("max number of snapshots kept by the --slot-save-auto cache (treated as a dedicated dir); oldest are evicted; no effect without --slot-save-auto, manual slot saves never evict (default: %d, 0 = unlimited)", params.slot_save_max_count),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--slot-save-max-count must be >= 0 (0 = unlimited)");
+            }
+            params.slot_save_max_count = value;
+        }
+    ).set_env("LLAMA_ARG_SLOT_SAVE_MAX_COUNT").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--slot-save-max-mb"}, "N",
+        string_format("max total size (MiB) of the --slot-save-auto cache; oldest snapshots are evicted; no effect without --slot-save-auto, manual slot saves never evict (default: %d, 0 = unlimited)", (int) (params.slot_save_max_bytes / (1024 * 1024))),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--slot-save-max-mb must be >= 0 (0 = unlimited)");
+            }
+            params.slot_save_max_bytes = (int64_t) value * 1024 * 1024;
+        }
+    ).set_env("LLAMA_ARG_SLOT_SAVE_MAX_MB").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--slot-save-auto"},
+        "automatically restore/save prompt KV to/from --slot-save-path across requests and restarts (transparent disk prompt cache); requires --slot-save-path (default: disabled)",
+        [](common_params & params) {
+            params.slot_save_auto = true;
+        }
+    ).set_env("LLAMA_ARG_SLOT_SAVE_AUTO").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--slot-save-block"}, "N",
+        string_format("token-ID hash block size for the auto disk cache index; reuse granularity "
+                      "is one block; must be a multiple of 128 (the KVarN descriptor group) when a "
+                      "KVarN cache type is used (default: %d)", params.slot_save_block),
+        [](common_params & params, int value) {
+            params.slot_save_block = value;
+        }
+    ).set_env("LLAMA_ARG_SLOT_SAVE_BLOCK").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--media-path"}, "PATH",
         "directory for loading local media files; files can be accessed via file:// URLs using relative paths (default: disabled)",
         [](common_params & params, const std::string & value) {
@@ -4638,6 +4864,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.n_min = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MIN"));
+    add_opt(common_arg(
+        {"--spec-draft-n-min-adaptive"}, "N",
+        string_format("minimum adaptive MTP draft depth; the depth starts here and never drops below it (default: %d)", params.speculative.draft.n_min_adaptive),
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.speculative.draft.n_min_adaptive = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MIN_ADAPTIVE"));
     add_opt(common_arg(
         {"--spec-synth-len"}, "L",
         "target mean synthetic acceptance length, including the target token (benchmarking only)",
