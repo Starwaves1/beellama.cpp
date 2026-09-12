@@ -246,6 +246,10 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--props` | enable changing global properties via POST /props (default: disabled)<br/>(env: LLAMA_ARG_ENDPOINT_PROPS) |
 | `--slots, --no-slots` | expose slots monitoring endpoint (default: enabled)<br/>(env: LLAMA_ARG_ENDPOINT_SLOTS) |
 | `--slot-save-path PATH` | path to save slot kv cache (default: disabled) |
+| `--slot-save-max-count N` | max number of slot-save snapshots kept in `--slot-save-path` (treated as a dedicated dir); oldest are evicted (default: 64, 0 = unlimited)<br/>(env: LLAMA_ARG_SLOT_SAVE_MAX_COUNT) |
+| `--slot-save-max-mb N` | max total size (MiB) of the `--slot-save-path` store; oldest snapshots are evicted (default: 32768, 0 = unlimited)<br/>(env: LLAMA_ARG_SLOT_SAVE_MAX_MB) |
+| `--slot-save-auto` | automatically restore/save prompt KV to/from `--slot-save-path` across requests and restarts (transparent disk prompt cache); requires `--slot-save-path` (default: disabled)<br/>(env: LLAMA_ARG_SLOT_SAVE_AUTO) |
+| `--slot-save-block N` | token-ID hash block size for the auto disk cache index; reuse granularity is one block; must be a multiple of the KVarN group when KVarN is enabled (default: 256)<br/>(env: LLAMA_ARG_SLOT_SAVE_BLOCK) |
 | `--media-path PATH` | directory for loading local media files; files can be accessed via file:// URLs using relative paths (default: disabled) |
 | `--models-dir PATH` | directory containing models for the router server (default: disabled)<br/>(env: LLAMA_ARG_MODELS_DIR) |
 | `--models-preset PATH` | path to INI file containing model presets for the router server (default: disabled)<br/>(env: LLAMA_ARG_MODELS_PRESET) |
@@ -353,6 +357,74 @@ services:
       LLAMA_ARG_ENDPOINT_METRICS: 1
       LLAMA_ARG_PORT: 8080
 ```
+
+### Automatic disk prompt cache (`--slot-save-auto`)
+
+`--slot-save-auto` turns `--slot-save-path` into a transparent, cross-process prompt/KV cache.
+It is **off by default**; when off, nothing below runs (no directory scan, no index, no per-request
+hashing) and server behavior is byte-for-byte unchanged.
+
+When on, the server:
+
+1. hashes each request's token IDs in blocks of `--slot-save-block` tokens (chained, so the hash at
+   every block boundary commits to the whole prefix up to that point);
+2. looks the deepest boundary up in an index built from the small `.meta` sidecars in
+   `--slot-save-path` (the multi-GB state file is never opened for a lookup);
+3. **byte-compares** the candidate's persisted token IDs against the request prefix and checks a
+   full model/context fingerprint before restoring anything - the hash alone is never trusted;
+4. persists a slot's KV to disk when the slot is about to lose it (idle-slot flush, or slot reassign
+   when `--cache-idle-slots` is off) - never during generation.
+
+A snapshot is a 3-file unit: `auto-<fp>-<hash>-<n>.bin` (the `llama_state_seq_save_file` state), plus
+`.meta` (token IDs + fingerprint) and, for recurrent/hybrid models only, `.logits` (the last decoded
+token's distribution, used to answer an exact-prompt "regenerate" without re-decoding into a state
+that cannot be rewound). `--slot-save-max-count` / `--slot-save-max-mb` bound the store with an
+LRU-by-mtime eviction that always removes the three files together; a single snapshot larger than the
+byte cap is rejected rather than evicting everything else. **Point these at a dedicated directory** -
+once a cap is set, any unrecognized regular file in it is an eviction candidate.
+
+Every failure mode (missing/corrupt file, fingerprint mismatch, I/O error, no match) falls back to a
+normal prefill. A stale cache can never produce wrong output, only a wasted lookup.
+
+#### Fingerprint: what invalidates the cache
+
+A snapshot is only reused by a server whose fingerprint matches exactly. The fingerprint covers the
+model identity (description, size, parameter count, vocab, `n_ctx_train`, `n_embd`, `n_layer`,
+rope type), the effective context (`n_ctx`, rope base/scale, all YaRN parameters), the LoRA set,
+whether `--mmproj` is loaded, `--slot-save-block`, the memory module's sequence-removal class, and -
+specific to BeeLlama - everything that changes KV geometry:
+
+* `--cache-type-k` / `--cache-type-v`, including the KVarN pseudo-types (`kvarn2` ... `kvarn8`) and
+  the derived KVarN descriptor (type, key/value bit widths, SWA key/value bit widths, group,
+  Sinkhorn iterations, sink tokens);
+* the KV precision tail: `--kv-tail-tokens` and `--kv-tail-type`;
+* `--swa-full`, `--kv-unified` and the per-slot unified context size;
+* `-b` / `-ub` / `-np` (KVarN bakes batch geometry into its stage/record ring depth);
+* the speculative configuration: draft type(s), draft model path, draft cache types, the draft KVarN
+  descriptor, and whether the draft owns its own KV cache.
+
+Change any of these and old snapshots are simply ignored (they stay on disk until the LRU reaps them).
+
+#### BeeLlama-specific restrictions
+
+* **Owned speculative draft caches are excluded.** `llama_state_seq_save_file` persists the *target*
+  context only, so a slot whose draft owns its own K/V cache (`--draft-dflash`, `--draft-mtp`,
+  EAGLE3, and any draft-model mode that allocates a draft cache) never auto-saves and never
+  auto-restores. The server logs a single warning the first time such a slot is skipped. Everything
+  else - including n-gram drafting, which has no draft KV cache - works normally.
+* **KVarN reuse is group-aligned.** KVarN can only roll a sequence back to a descriptor-group
+  boundary (`--kvarn-group`, 128 by default), so `--slot-save-block` must be a multiple of it; the
+  server refuses to start otherwise.
+* **Non-`PART` memory restores whole snapshots only.** For recurrent/hybrid memory (`FULL`) and for
+  KVarN (`RS`, bounded group-aligned rollback), a snapshot is restored only when the entire snapshot
+  is a verified prefix of the request. A request that diverges *inside* a snapshot falls back to a
+  normal prefill instead of attempting a rollback the memory module cannot perform. Standard
+  attention caches (`PART`) may restore a partial prefix, clamped down to a block boundary.
+* **Multimodal turns are never persisted.** A prompt containing any image/audio chunk is skipped in
+  both directions, since token IDs cannot identify media content. Text-only turns on an `--mmproj`
+  server are cached normally, but in a store disjoint from a text-only server's.
+* **`--kv-unified` with several parallel slots.** KVarN refuses a per-sequence snapshot while another
+  logical sequence owns the shared stream; such saves simply fail and are skipped.
 
 ### Multimodal support
 

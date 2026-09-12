@@ -1117,7 +1117,35 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         params.default_template_kwargs["preserve_reasoning"] = "true";
     }
 
+    // the auto disk prompt/KV cache needs a directory to live in; fail fast & loud rather than
+    // silently doing nothing if --slot-save-auto is set without --slot-save-path.
+    if (params.slot_save_auto && params.slot_save_path.empty()) {
+        throw std::invalid_argument("--slot-save-auto requires --slot-save-path to be set");
+    }
+    if (params.slot_save_auto && params.slot_save_block <= 0) {
+        throw std::invalid_argument("--slot-save-block must be > 0");
+    }
     return true;
+}
+
+// BeeLlama: KVarN reuses prompt prefixes only at descriptor-group boundaries
+// (kvarn.group, 128 by default). A block size that is not a multiple of the group
+// would hand the server prefix lengths it can never roll back to, so reject it here
+// instead of silently producing unusable snapshots.
+//
+// MUST be called after common_params_kvarn_normalize(): params.kvarn is derived from
+// --cache-type-k/-v there, so it is still DISABLED while common_params_parse_ex() runs.
+static void common_validate_slot_save_auto(const common_params & params) {
+    if (!params.slot_save_auto || params.kvarn.type == LLAMA_KVARN_TYPE_DISABLED) {
+        return;
+    }
+
+    const int32_t group = params.kvarn.group > 0 ? params.kvarn.group : 128;
+    if (params.slot_save_block % group != 0) {
+        throw std::invalid_argument(string_format(
+            "--slot-save-block (%d) must be a multiple of the KVarN group size (%d)",
+            params.slot_save_block, group));
+    }
 }
 
 static void common_params_print_usage(common_params_context & ctx_arg) {
@@ -1576,6 +1604,7 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
         common_params_kvarn_normalize(ctx_arg.params);
         common_params_draft_kvarn_normalize(ctx_arg.params);
         common_validate_draft_kvarn_mode(ctx_arg.params.speculative);
+        common_validate_slot_save_auto(ctx_arg.params);
         ctx_arg.params.lr.init();
         common_validate_reasoning_loop_guard_params(ctx_arg.params.reasoning_loop_guard);
         ctx_arg.params.sampling.reasoning_budget_tracking =
@@ -4128,6 +4157,41 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--slot-save-max-count"}, "N",
+        string_format("max number of slot-save snapshots kept in --slot-save-path (treated as a dedicated dir); oldest are evicted (default: %d, 0 = unlimited)", params.slot_save_max_count),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--slot-save-max-count must be >= 0 (0 = unlimited)");
+            }
+            params.slot_save_max_count = value;
+        }
+    ).set_env("LLAMA_ARG_SLOT_SAVE_MAX_COUNT").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--slot-save-max-mb"}, "N",
+        string_format("max total size (MiB) of the --slot-save-path store; oldest snapshots are evicted (default: %d, 0 = unlimited)", (int) (params.slot_save_max_bytes / (1024 * 1024))),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--slot-save-max-mb must be >= 0 (0 = unlimited)");
+            }
+            params.slot_save_max_bytes = (int64_t) value * 1024 * 1024;
+        }
+    ).set_env("LLAMA_ARG_SLOT_SAVE_MAX_MB").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--slot-save-auto"},
+        "automatically restore/save prompt KV to/from --slot-save-path across requests and restarts (transparent disk prompt cache); requires --slot-save-path (default: disabled)",
+        [](common_params & params) {
+            params.slot_save_auto = true;
+        }
+    ).set_env("LLAMA_ARG_SLOT_SAVE_AUTO").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--slot-save-block"}, "N",
+        string_format("token-ID hash block size for the auto disk cache index; reuse granularity "
+                      "is one block; must be a multiple of the KVarN group when KVarN is enabled (default: %d)", params.slot_save_block),
+        [](common_params & params, int value) {
+            params.slot_save_block = value;
+        }
+    ).set_env("LLAMA_ARG_SLOT_SAVE_BLOCK").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--media-path"}, "PATH",
         "directory for loading local media files; files can be accessed via file:// URLs using relative paths (default: disabled)",
