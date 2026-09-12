@@ -1,5 +1,15 @@
 # Anbeeld's BeeLlama.cpp
 
+> ## ⚠️ This is an unmaintained personal fork. Read this first.
+>
+> **This repository (Starwaves1/beellama.cpp) is NOT the real BeeLlama.cpp.** The real project is [Anbeeld/beellama.cpp](https://github.com/Anbeeld/beellama.cpp). Go there for releases, issues, benchmarks and support. Everything below this box is Anbeeld's README, kept as-is.
+>
+> **What this fork is:** a single feature add on top of BeeLlama v0.4.6, made in one afternoon with AI coding agents (vibe coded): Claude Fable 5.1 orchestrating Claude Opus 4.8 subagents, with no code written by a human. It bolts three unmerged upstream llama.cpp pull requests onto Bee: per-section reasoning sampling overrides ([#25709](https://github.com/ggml-org/llama.cpp/pull/25709)), adaptive MTP draft depth ([#27210](https://github.com/ggml-org/llama.cpp/pull/27210)), and an opt-in disk prompt/KV cache ([#24004](https://github.com/ggml-org/llama.cpp/pull/24004), closed upstream). It also adds a server-only CUDA build script for one specific machine.
+>
+> **What it is not:** maintained, tested on a GPU, benchmarked, reviewed by a human, or in any way endorsed by Anbeeld or the llama.cpp maintainers. It has been compiled on CPU and its unit tests pass; nothing has been run against a real model. It will not track upstream or Bee releases. Do not open issues here expecting a response. Do not report bugs from this fork to Anbeeld or ggml-org.
+>
+> The full record of what was changed, why, what was verified and what was not is in [docs/integration-notes-v0.4.6-prs.md](docs/integration-notes-v0.4.6-prs.md).
+
 ![BeeLlama.cpp logo](beellama.jpg)
 
 BeeLlama.cpp (or just Bee) is a performance-focused llama.cpp fork for squeezing more speed and context out of local GGUF inference. It adds variance-normalized KV-cache quantization (KVarN), KV cache precision tail for recent tokens, low-bit cache types, adaptive draft control for speculative decoding, reasoning-loop protection, and more.
