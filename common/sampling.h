@@ -53,6 +53,12 @@ struct common_sampler * common_sampler_init(
         const struct llama_model * model,
         struct common_params_sampling & params);
 
+// Update reasoning markers after applying a chat template.
+void common_sampler_configure_reasoning(
+        struct common_sampler * gsmpl,
+        const llama_vocab * vocab,
+        const common_params_sampling & params);
+
 void common_sampler_free(struct common_sampler * gsmpl);
 
 // if is_generated is true, the token is accepted by the sampling chain, the reasoning budget sampler, and the grammar sampler
