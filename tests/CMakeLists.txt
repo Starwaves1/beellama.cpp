@@ -488,6 +488,7 @@ llama_build_and_test(test-thread-safety.cpp ARGS -m "${MODEL_DEST}" -ngl 99 -p "
 set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
 
 llama_build_and_test(test-arg-parser.cpp)
+llama_build_and_test(test-speculative-adaptive.cpp)
 llama_build_and_test(test-kv-history.cpp)
 target_include_directories(test-kv-history PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
