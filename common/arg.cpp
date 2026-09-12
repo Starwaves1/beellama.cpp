@@ -4159,7 +4159,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--slot-save-max-count"}, "N",
-        string_format("max number of slot-save snapshots kept in --slot-save-path (treated as a dedicated dir); oldest are evicted (default: %d, 0 = unlimited)", params.slot_save_max_count),
+        string_format("max number of snapshots kept by the --slot-save-auto cache (treated as a dedicated dir); oldest are evicted; no effect without --slot-save-auto, manual slot saves never evict (default: %d, 0 = unlimited)", params.slot_save_max_count),
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("--slot-save-max-count must be >= 0 (0 = unlimited)");
@@ -4169,7 +4169,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_SLOT_SAVE_MAX_COUNT").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--slot-save-max-mb"}, "N",
-        string_format("max total size (MiB) of the --slot-save-path store; oldest snapshots are evicted (default: %d, 0 = unlimited)", (int) (params.slot_save_max_bytes / (1024 * 1024))),
+        string_format("max total size (MiB) of the --slot-save-auto cache; oldest snapshots are evicted; no effect without --slot-save-auto, manual slot saves never evict (default: %d, 0 = unlimited)", (int) (params.slot_save_max_bytes / (1024 * 1024))),
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("--slot-save-max-mb must be >= 0 (0 = unlimited)");
@@ -4187,7 +4187,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--slot-save-block"}, "N",
         string_format("token-ID hash block size for the auto disk cache index; reuse granularity "
-                      "is one block; must be a multiple of the KVarN group when KVarN is enabled (default: %d)", params.slot_save_block),
+                      "is one block; must be a multiple of 128 (the KVarN descriptor group) when a "
+                      "KVarN cache type is used (default: %d)", params.slot_save_block),
         [](common_params & params, int value) {
             params.slot_save_block = value;
         }

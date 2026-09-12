@@ -440,9 +440,11 @@ struct slot_save_unit {
 // reject the save rather than evict everything else. Operates strictly within `dir`; uses only
 // the error_code std::filesystem overloads so it never throws across the server loop.
 //
-// IMPORTANT: when a cap is set, --slot-save-path is treated as a server-owned store - any regular
-// file in it (other than recognized "<X>.logits"/"<X>.meta" sidecars and "*.tmp" temporaries) is an
-// eviction candidate. Point --slot-save-max-count/-mb at a DEDICATED directory.
+// IMPORTANT: this runs ONLY while the automatic disk cache (--slot-save-auto) is enabled; a manual
+// /slots save never evicts. With the auto cache on and a cap set, --slot-save-path is treated as a
+// server-owned store - any regular file in it (other than recognized "<X>.logits"/"<X>.meta"
+// sidecars and in-flight temporaries) is an eviction candidate, so point --slot-save-auto at a
+// DEDICATED directory.
 static void slot_save_enforce_limits(const std::string & dir,
                                      int32_t max_count, int64_t max_bytes,
                                      const std::string & just_written,
@@ -473,8 +475,16 @@ static void slot_save_enforce_limits(const std::string & dir,
 
         for (const std::string & p : all_files) {
             std::error_code fec;
-            // in-flight temp files are never counted or evicted (a concurrent save owns them)
-            if (p.size() >= 4 && p.compare(p.size() - 4, 4, ".tmp") == 0) {
+            // In-flight temp files are never counted, evicted or reaped (a concurrent save, possibly
+            // in a PEER PROCESS, owns them). The auto-save temp base is "<final>.<pid>.<nonce>.tmp"
+            // and its sidecars are "<base>.logits" / "<base>.meta" (themselves written through
+            // "<base>.logits.tmp" / "<base>.meta.tmp"). Between the three publish renames the
+            // sidecars exist while their base does not, so an "ends with .tmp" test alone would
+            // classify them as orphans and delete a peer's in-flight unit. Match the whole scheme:
+            // anything ending in ".tmp" OR carrying ".tmp." anywhere in its name.
+            const std::string bname = std::filesystem::path(p).filename().string();
+            if ((bname.size() >= 4 && bname.compare(bname.size() - 4, 4, ".tmp") == 0) ||
+                bname.find(".tmp.") != std::string::npos) {
                 continue;
             }
             // a "<X>.logits"/"<X>.meta" file is a sidecar ONLY when its state file "<X>" is also
@@ -725,8 +735,9 @@ struct model_fp {
 
 // Returns, for each block boundary b in [1 .. n/B], the cumulative chain hash
 // committing to tokens[0 .. b*B). out[k] = hash of prefix length (k+1)*B. The
-// chain is salted with `salt` (the model fingerprint hash) so two different models
-// can never produce the same boundary hash for identical tokens. A trailing
+// chain is salted with `salt` (auto_name_salt(): model identity + KV geometry + draft
+// configuration) so two different models - or two differently-configured servers sharing
+// one --slot-save-path - can never produce the same boundary hash for identical tokens. A trailing
 // partial block is NOT a boundary (only whole-block prefixes are index keys).
 static std::vector<uint64_t> auto_block_hashes(const llama_tokens & toks, int B, uint64_t salt) {
     std::vector<uint64_t> out;
@@ -3415,6 +3426,13 @@ private:
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
+        // Checkpoints disabled (--ctx-checkpoints 0): nothing may be created. The eviction loop
+        // below would otherwise pop from an empty vector when the cap is 0. Every caller already
+        // guards on this, so this is defensive only and changes no existing behavior.
+        if (params_base.n_ctx_checkpoints <= 0) {
+            return;
+        }
+
         const int id_task = slot.task->id;
 
         const int64_t n_tokens_checkpoint = slot.prompt.n_tokens() - n_tokens_cur;
@@ -3661,13 +3679,35 @@ private:
         return fp;
     }
 
-    // Auto-snapshot filename: model-fp prefix lets the startup scan reject foreign-model files by
-    // name before opening anything; chain-hash + token-count make it deterministic across processes
-    // (a same-prefix save from another process yields the same name -> atomic-rename-idempotent).
+    // Name/hash salt for the auto store. Two servers on the SAME model but with different KV
+    // geometry (e.g. --cache-type-k f16 vs kvarn4) or a different draft configuration must not
+    // produce the same file names: they would repeatedly overwrite and evict each other's snapshots
+    // while the fingerprint check correctly refused every restore (fails closed, but thrashes).
+    // Folding the two BeeLlama hashes and the explicit cache types into the salt gives each
+    // configuration its own name space inside one shared --slot-save-path.
+    //
+    // MUST be computed identically at save, index scan and lookup - it salts both the filename
+    // prefix and the block chain hashes, so a mismatch silently splits the index from the store.
+    // It derives only from `cur_fp`, which is computed once at init, so every site agrees.
+    uint64_t auto_name_salt() const {
+        uint64_t h = cur_fp.fp_model;
+        h = auto_hash_mix(h, (int32_t) (cur_fp.fp_bee_kv  & 0xFFFFFFFFu));
+        h = auto_hash_mix(h, (int32_t) (cur_fp.fp_bee_kv  >> 32));
+        h = auto_hash_mix(h, (int32_t) (cur_fp.fp_bee_dft & 0xFFFFFFFFu));
+        h = auto_hash_mix(h, (int32_t) (cur_fp.fp_bee_dft >> 32));
+        h = auto_hash_mix(h, (int32_t) cur_fp.fp_cache_k);
+        h = auto_hash_mix(h, (int32_t) cur_fp.fp_cache_v);
+        return h;
+    }
+
+    // Auto-snapshot filename: the salt prefix lets the startup scan reject files belonging to a
+    // foreign model OR to a differently-configured peer by name before opening anything; chain-hash
+    // + token-count make it deterministic across processes (a same-prefix save from another process
+    // yields the same name -> atomic-rename-idempotent).
     std::string auto_state_filename(uint64_t chain_hash, size_t n_tokens) const {
-        char buf[96]; // "auto-" + 16 hex fp + "-" + 16 hex hash + "-" + up to 20-digit count + ".bin" < 96
+        char buf[96]; // "auto-" + 16 hex salt + "-" + 16 hex hash + "-" + up to 20-digit count + ".bin" < 96
         snprintf(buf, sizeof(buf), "auto-%016" PRIx64 "-%016" PRIx64 "-%zu.bin",
-                 cur_fp.fp_model, chain_hash, n_tokens);
+                 auto_name_salt(), chain_hash, n_tokens);
         return params_base.slot_save_path + std::string(buf);
     }
 
@@ -3717,7 +3757,7 @@ private:
             if (!(fp == cur_fp)) {
                 continue; // foreign model / requant / different KV geometry (invariant 3)
             }
-            const auto bhs = auto_block_hashes(toks, params_base.slot_save_block, cur_fp.fp_model);
+            const auto bhs = auto_block_hashes(toks, params_base.slot_save_block, auto_name_salt());
             auto_cache_entry e{ p, (uint32_t) toks.size(), fp };
             for (uint64_t bh : bhs) {
                 auto_index_insert_locked(bh, e);
@@ -3786,7 +3826,7 @@ private:
         if (!auto_cache_enabled()) {
             return std::nullopt; // off by default
         }
-        const auto bhs = auto_block_hashes(req, params_base.slot_save_block, cur_fp.fp_model);
+        const auto bhs = auto_block_hashes(req, params_base.slot_save_block, auto_name_salt());
         std::lock_guard<std::mutex> lk(auto_idx.mtx);
         auto_index_refresh_locked(/*force=*/false);
         for (int attempt = 0; attempt < 2; ++attempt) {
@@ -3865,8 +3905,16 @@ private:
         // Reconstruct a context checkpoint at the restored position so hybrid/recurrent (and SWA,
         // and KVarN) models - which cannot freely rewind - can reuse this state for the suffix.
         // create_checkpoint() dereferences slot.task, so this is only possible on the prefill path
-        // (auto-restore); the manual SLOT_RESTORE endpoint runs on an idle, task-less slot.
-        if (slot.task && ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART) {
+        // (auto-restore); the manual SLOT_RESTORE endpoint runs on an idle, task-less slot. The
+        // --ctx-checkpoints 0 guard matches the pre-existing create_checkpoint() call site.
+        //
+        // NOTE (KVarN/RS): create_checkpoint() additionally bails out when the restored token count
+        // is not a multiple of the KVarN descriptor group (prompt_reuse_boundary_is_stable), so a
+        // snapshot whose length is not group-aligned gets NO checkpoint here. Such a restore then
+        // relies entirely on the live seq-rm rollback plan for any suffix rewind; if that is
+        // refused, the request falls back to a normal prefill (never wrong output).
+        if (slot.task && params_base.n_ctx_checkpoints > 0 &&
+            ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART) {
             const auto ckpt_pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
             const auto ckpt_pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
             if (ckpt_pos_min >= 0) {
@@ -3893,10 +3941,15 @@ private:
     }
 
     // AUTO-RESTORE wrapper: byte-verify the candidate's persisted tokens against the request prefix
-    // (invariant 2), confirm the fingerprint (invariant 3), then restore. Returns the verified
-    // prefix length actually restored, or 0 if nothing was restored (caller keeps the in-memory
-    // prefill path). `req` is the full request token-ID array; `n_keep_mem` is the in-memory match
-    // to beat.
+    // (invariant 2), confirm the fingerprint (invariant 3), then restore. Returns the claimed reuse
+    // length used to decide whether the restore is worth it, or 0 if nothing was restored (caller
+    // keeps the in-memory prefill path). `req` is the full request token-ID array; `n_keep_mem` is
+    // the in-memory match to beat.
+    //
+    // NOTE: a successful restore always loads the WHOLE snapshot into the slot - the return value is
+    // a reuse-margin estimate, not a bound on what lands in the slot. The caller recomputes the
+    // actual reusable prefix from slot.prompt.tokens and trims the rest through the normal
+    // rollback path.
     int auto_restore_into_slot(server_slot & slot, const auto_cache_entry & cand,
                                const llama_tokens & req, int n_keep_mem) {
         // read the small .meta sidecar (tokens + fp) - never opens the multi-GB state file.
@@ -3918,8 +3971,12 @@ private:
         int n_keep_disk;
         if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART) {
             // Attention (PART) memory supports per-token partial seq_rm, so a mid-snapshot
-            // divergence is fine: claim the verified prefix clamped down to the last whole block
-            // boundary <= v. An exact full-snapshot match keeps the whole snapshot length.
+            // divergence is fine. The block clamp here is purely a MARGIN HEURISTIC feeding the
+            // "must beat the in-memory match by a block" gate below: it rounds the verified prefix
+            // down to a whole block so a near-miss does not justify a multi-GB load. It does NOT
+            // limit the restore - do_slot_restore always loads the entire snapshot, and the caller
+            // (which ignores this return value) recomputes the real common prefix and rolls the
+            // remainder back per-token.
             if (v == disk_toks.size()) {
                 n_keep_disk = (int) disk_toks.size();
             } else {
@@ -4000,7 +4057,7 @@ private:
         if ((int) toks.size() < params_base.slot_save_block) {
             return; // < 1 block: not worth a multi-GB write
         }
-        const auto bhs = auto_block_hashes(toks, params_base.slot_save_block, cur_fp.fp_model);
+        const auto bhs = auto_block_hashes(toks, params_base.slot_save_block, auto_name_salt());
         if (bhs.empty()) {
             return;
         }
@@ -4394,7 +4451,13 @@ private:
 
                     // enforce the bounded slot-save store (LRU by mtime). If this single snapshot
                     // exceeds the byte cap, reject the save instead of evicting everything.
-                    if (params_base.slot_save_max_count > 0 || params_base.slot_save_max_bytes > 0) {
+                    //
+                    // ONLY when the automatic disk cache is on: the caps describe the server-owned
+                    // auto store. A server that just uses the manual /slots save API with
+                    // --slot-save-path owns its own file naming and lifetime, so a manual save must
+                    // never delete anything in that directory.
+                    if (auto_cache_enabled() &&
+                        (params_base.slot_save_max_count > 0 || params_base.slot_save_max_bytes > 0)) {
                         bool oversized = false;
                         slot_save_enforce_limits(params_base.slot_save_path,
                                                  params_base.slot_save_max_count,
