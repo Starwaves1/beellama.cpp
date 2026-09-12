@@ -114,6 +114,9 @@ Key binaries are `llama-server`, `llama-cli`, `llama-bench`, and
 - `docs/quickstart-qwen36-dflash.md` - Qwen3.6 DFlash guide.
 - `docs/quickstart-gemma-4-31b-dflash.md` - Gemma 4 DFlash guide.
 - `docs/preset.md` - INI preset format.
+- `docs/build-server-cuda.md` - server-only CUDA build and FlashAttention pair selection.
+- `docs/integration-notes-v0.4.6-prs.md` - how upstream PRs #25709, #27210 and #24004 were
+  integrated on the v0.4.6 base.
 
 ### Invariants
 
