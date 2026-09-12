@@ -238,12 +238,15 @@ path as `draft-mtp`, but the draft depth is chosen per sequence by an upstream
 hysteresis controller that climbs after consecutive full accepts and drops
 under accumulated miss pressure. The depth stays inside
 `[--spec-draft-n-min-adaptive, --spec-draft-n-max]`, and the depth learned for
-one generation is reset when a new generation begins.
+one generation is reset when a new generation begins. With the defaults
+(`--spec-draft-n-max 3`, `--spec-draft-n-min-adaptive 3`) the floor equals the
+ceiling and the depth is effectively fixed, so raise `--spec-draft-n-max` above
+`3` (upstream recommends `12`) to give the controller room to climb.
 
 | Argument | Env var | Default | Behavior |
 |---|---|---|---|
 | `--spec-type draft-mtp-adaptive` | `LLAMA_ARG_SPEC_TYPE` | `none` | Enables MTP drafting with the adaptive depth controller. Cannot be combined with `draft-mtp`. |
-| `--spec-draft-n-min-adaptive N` | `LLAMA_ARG_SPEC_DRAFT_N_MIN_ADAPTIVE` | `3` | Sets the adaptive depth floor and the starting depth. Must be in `[1, --spec-draft-n-max]`; `--spec-draft-n-max` may itself be capped by the model's MTP layer count. `--spec-draft-n-min` is ignored in this mode. |
+| `--spec-draft-n-min-adaptive N` | `LLAMA_ARG_SPEC_DRAFT_N_MIN_ADAPTIVE` | `3` | Sets the adaptive depth floor and the starting depth. Must be in `[1, --spec-draft-n-max]`; `--spec-draft-n-max` may itself be capped by the model's MTP layer count, and a floor above that model cap is clamped down to it with a warning instead of failing. `--spec-draft-n-min` is ignored in this mode. |
 
 Like `draft-mtp`, this type owns its draft KV context, so the KVarN draft cache
 presets apply: `--spec-draft-type-k kvarnN` and `--spec-draft-type-v kvarnN`

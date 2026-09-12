@@ -1501,18 +1501,28 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         this->n_max = this->params.n_max;
 
         if (adaptive) {
-            // a floor above the ceiling would pin the depth below the floor, so the
-            // configuration is invalid
-            if (this->params.n_min_adaptive < 1 || this->params.n_min_adaptive > this->params.n_max) {
-                if (n_max_user > this->params.n_max) {
-                    // n_max was capped by the MTP layer count, not by the user
-                    throw std::runtime_error(string_format(
-                            "invalid adaptive draft range: n_min_adaptive=%d, n_max=%d (n_max is capped by the model MTP layer count %d; set --spec-draft-n-min-adaptive to at most %d)",
-                            this->params.n_min_adaptive, this->params.n_max, n_mtp_layers, n_mtp_layers));
-                }
+            if (this->params.n_min_adaptive < 1) {
                 throw std::runtime_error(string_format(
                         "invalid adaptive draft range: n_min_adaptive=%d, n_max=%d (n_min_adaptive must be in [1, n_max])",
                         this->params.n_min_adaptive, this->params.n_max));
+            }
+
+            if (this->params.n_min_adaptive > this->params.n_max) {
+                if (n_max_user > this->params.n_max) {
+                    // n_max was capped by the model MTP layer count, not by the user, so
+                    // the floor is not a configuration error: clamp it to the cap instead
+                    // of refusing to start. The default floor of 3 would otherwise abort
+                    // startup on every model with fewer than 3 chained MTP layers.
+                    SPC_WRN("n_min_adaptive=%d exceeds n_max=%d capped by the model MTP layer count %d; clamping the adaptive floor to %d\n",
+                            this->params.n_min_adaptive, this->params.n_max, n_mtp_layers, this->params.n_max);
+                    this->params.n_min_adaptive = this->params.n_max;
+                } else {
+                    // a user-supplied floor above a user-supplied ceiling would pin the
+                    // depth below the floor, so the configuration is invalid
+                    throw std::runtime_error(string_format(
+                            "invalid adaptive draft range: n_min_adaptive=%d, n_max=%d (n_min_adaptive must be in [1, n_max])",
+                            this->params.n_min_adaptive, this->params.n_max));
+                }
             }
 
             adaptive_ctrl.assign(n_seq, common_speculative_adaptive());
@@ -1579,6 +1589,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+
         // new generation: the depth learned for the previous content is stale,
         // so the controller starts from the floor again, even for an empty prompt
         if (adaptive) {

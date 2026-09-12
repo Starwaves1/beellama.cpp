@@ -21,6 +21,17 @@ static void test_reset(void) {
     // the ceiling clamps the cold start to n_max
     ctrl.reset(1, 3);
     assert(ctrl.n_cur == 1);
+
+    // a model whose MTP layer count caps n_max below the default floor of 3:
+    // the setup clamps the floor down to the cap, and the controller starts
+    // (and stays) there instead of being pinned above the ceiling
+    ctrl.reset(2, 2);
+    assert(ctrl.n_cur == 2);
+    for (int i = 0; i < 100; ++i) {
+        ctrl.update(2, 0, 2, 2);
+    }
+    assert(ctrl.n_cur == 2);
+    assert(ctrl.n_drop == 0);
 }
 
 static void test_climb(void) {
