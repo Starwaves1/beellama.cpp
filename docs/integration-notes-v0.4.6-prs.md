@@ -32,6 +32,8 @@ Commits on the branch, oldest first:
 | `1816b746c7` | opt-in automatic disk prompt/KV cache, `--slot-save-auto` (upstream PR #24004) |
 | `743806bf14` | `test-arg-parser` stderr capture fix |
 | `7e27339b58` | `draft-mtp-adaptive` hardening |
+| `07ecade631` | server-only CUDA build script and these integration notes |
+| `20628cb0b7` | `--slot-save-auto` restore and eviction hardening |
 
 Upstream status at the time of integration: #25709 open, #27210 open and under review, #24004
 closed without being merged. None of the three is a merged upstream commit, so none of them can
@@ -244,6 +246,36 @@ fork already guards both divisors. Restore-continue is deliberately `FULL`-only:
 `PART` a no-suffix regenerate needs a one-token rollback that the fork's live rollback plan
 already performs natively, so the consequence is that the `.logits` sidecar only ever exists for
 recurrent and hybrid targets.
+
+Hardening pass, commit `20628cb0b7`, after re-reading the port against the fork's own invariants.
+Five changes. `create_checkpoint()` now returns immediately when `--ctx-checkpoints` is 0; every
+caller already guarded on that, but the post-restore rebuild added by this PR did not, and the
+function's eviction loop pops from an empty vector when the cap is 0. That rebuild site gained the
+same explicit `n_ctx_checkpoints > 0` condition. The `--slot-save-max-count` / `--slot-save-max-mb`
+eviction now runs only when `auto_cache_enabled()`, because the caps describe the server-owned auto
+store: a server that only uses the manual `/slots` save API owns its own file naming and lifetime in
+`--slot-save-path`, and a manual save must never delete anything there. The two help strings say so.
+Snapshot names and block chain hashes are now salted with `auto_name_salt()` — the model
+fingerprint folded with `fp_bee_kv`, `fp_bee_dft` and the two explicit cache types — instead of
+`fp_model` alone. Two servers on the same model but with different KV geometry (`f16` versus
+`kvarn4`) or a different draft configuration would otherwise generate identical names in a shared
+`--slot-save-path`, overwriting and evicting each other's snapshots while the fingerprint check
+correctly refused every restore: fails closed, but thrashes. The salt must be computed identically
+at save, index scan and lookup, since it salts both the filename prefix and the chain hashes; it
+derives only from `cur_fp`, which is computed once at init. The orphan reaper's temp-file test was
+widened from "ends with `.tmp`" to "ends with `.tmp` or contains `.tmp.`": the auto-save temp base is
+`<final>.<pid>.<nonce>.tmp` and its sidecars are `<base>.logits` / `<base>.meta`, which between the
+three publish renames exist while their base does not, so the narrow test classified a peer
+process's in-flight sidecars as orphans and deleted them. Finally, comments and
+`tools/server/README.md` were corrected on two points that were previously stated wrong: the
+`--slot-save-block` alignment requirement is a multiple of 128, the KVarN descriptor group, when a
+KVarN cache type is in use; and the block clamp inside `auto_restore_into_slot` is only a margin
+heuristic feeding the "must beat the in-memory match by a block" gate — a successful restore always
+loads the whole snapshot, and the caller recomputes the real reusable prefix and rolls the remainder
+back per token. The same comment records that a snapshot whose length is not group-aligned gets no
+post-restore checkpoint at all, because `create_checkpoint()` independently bails on
+`prompt_reuse_boundary_is_stable`, and such a restore then depends entirely on the live seq-rm
+rollback plan, falling back to a normal prefill if that is refused.
 
 ### 2.4 The test fix
 
